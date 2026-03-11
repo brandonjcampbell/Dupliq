@@ -1075,7 +1075,58 @@ function InterpretBadge({ status }) {
   return null;
 }
 
-function MatchCard({ rank, i, j, score, chunkA, chunkB, isExpanded, onToggle, interpretation, interpStatus, onInterpret, microSize }) {
+// Reusable interpret trigger — works anywhere a pair is displayed
+function InterpretBtn({ i, j, score, chunkA, chunkB, interpretation, status, onInterpret }) {
+  var has = !!interpretation;
+  var loading = status === "loading";
+  return (
+    <div style={{
+      marginTop: 8, background: "#0c0e16", borderRadius: 6,
+      padding: has ? "10px 12px" : "8px 12px",
+      border: "1px solid #818cf815",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: has ? 6 : 0 }}>
+        <span style={{ ...mono9, color: "#818cf8", letterSpacing: 1 }}>{"\u{1F9E0}"} LLM</span>
+        {!loading && (
+          <button onClick={e => { e.stopPropagation(); onInterpret(i, j, score, chunkA, chunkB); }} style={{
+            ...mono9, background: "#818cf818", border: "1px solid #818cf830",
+            color: "#818cf8", borderRadius: 4, padding: "2px 8px", cursor: "pointer",
+          }}>{has ? "\u21BB re-interpret" : "\u25B6 interpret"}</button>
+        )}
+        {loading && (
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <div style={{ width: 10, height: 10, border: "2px solid #818cf840", borderTopColor: "#818cf8", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+            <span style={{ ...mono9, color: "#818cf8" }}>querying...</span>
+          </div>
+        )}
+      </div>
+      {status === "error" && <div style={{ ...mono9, color: "#f87171", marginTop: 4 }}>Failed to reach Ollama</div>}
+      {has && !loading && (
+        <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 12, color: "#b0b8c8", lineHeight: 1.7, whiteSpace: "pre-wrap" }}>{interpretation}</div>
+      )}
+    </div>
+  );
+}
+
+function ChunkDrillBtn({ doc, idx, onDrill, drilling }) {
+  if (!onDrill) return null;
+  return (
+    <button
+      onClick={e => { e.stopPropagation(); onDrill(doc, idx); }}
+      disabled={drilling}
+      title={"Drill " + doc + (idx+1) + " into sub-chunks"}
+      style={{
+        ...mono9, fontSize: 7, padding: "1px 4px",
+        background: "#34d39910", border: "1px solid #34d39930",
+        color: drilling ? "#2a2f3a" : "#34d399", borderRadius: 3,
+        cursor: drilling ? "not-allowed" : "pointer",
+        marginLeft: 4, verticalAlign: "middle",
+      }}
+    >{"\u{1F50D}"}</button>
+  );
+}
+
+function MatchCard({ rank, i, j, score, chunkA, chunkB, isExpanded, onToggle, interpretation, interpStatus, onInterpret, microSize, onDrillChunk, drilling }) {
   const barW = Math.max(4, score * 100);
   return (
     <div onClick={onToggle} style={{
@@ -1106,34 +1157,19 @@ function MatchCard({ rank, i, j, score, chunkA, chunkB, isExpanded, onToggle, in
         <div style={{ marginTop: 16 }}>
           <div style={{ display: "flex", gap: 12 }}>
             <div style={{ flex: "1 1 50%", minWidth: 0, background: "#141822", borderRadius: 6, padding: 12, borderLeft: "3px solid #60a5fa30", overflow: "hidden" }}>
-              <div style={{ ...mono9, color: "#60a5fa", marginBottom: 6, letterSpacing: 1 }}>DOC A {"\u00B7"} CHUNK {i+1}</div>
+              <div style={{ ...mono9, color: "#60a5fa", marginBottom: 6, letterSpacing: 1 }}>DOC A {"\u00B7"} CHUNK {i+1} <ChunkDrillBtn doc="A" idx={i} onDrill={onDrillChunk} drilling={drilling} /></div>
               <ChunkContent text={chunkA} maxLen={600} />
             </div>
             <div style={{ flex: "1 1 50%", minWidth: 0, background: "#141822", borderRadius: 6, padding: 12, borderLeft: "3px solid #f59e4230", overflow: "hidden" }}>
-              <div style={{ ...mono9, color: "#f59e42", marginBottom: 6, letterSpacing: 1 }}>DOC B {"\u00B7"} CHUNK {j+1}</div>
+              <div style={{ ...mono9, color: "#f59e42", marginBottom: 6, letterSpacing: 1 }}>DOC B {"\u00B7"} CHUNK {j+1} <ChunkDrillBtn doc="B" idx={j} onDrill={onDrillChunk} drilling={drilling} /></div>
               <ChunkContent text={chunkB} maxLen={600} />
             </div>
           </div>
-          <div style={{ marginTop: 12, background: "#0c0e16", borderRadius: 6, padding: 14, border: "1px solid #818cf815" }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-              <div style={{ ...mono9, color: "#818cf8", letterSpacing: 1 }}>{"\u{1F9E0}"} LLM INTERPRETATION</div>
-              {interpStatus !== "loading" && (
-                <button onClick={e => { e.stopPropagation(); onInterpret(); }} style={{
-                  ...mono9, background: "#818cf818", border: "1px solid #818cf830",
-                  color: "#818cf8", borderRadius: 4, padding: "3px 10px", cursor: "pointer",
-                }}>{interpretation ? "\u21BB re-interpret" : "\u25B6 interpret"}</button>
-              )}
-            </div>
-            {interpStatus === "loading" && (
-              <div style={{ display: "flex", alignItems: "center", gap: 8, color: "#4a5568" }}>
-                <div style={{ width: 14, height: 14, border: "2px solid #818cf840", borderTopColor: "#818cf8", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
-                <span style={mono10}>Querying model...</span>
-              </div>
-            )}
-            {interpStatus === "error" && <div style={{ ...mono10, color: "#f87171", lineHeight: 1.6 }}>Could not reach Ollama. Ensure it is running at the configured URL.</div>}
-            {interpretation && interpStatus !== "loading" && <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 13, color: "#b0b8c8", lineHeight: 1.8, whiteSpace: "pre-wrap" }}>{interpretation}</div>}
-            {!interpretation && interpStatus !== "loading" && interpStatus !== "error" && <div style={{ ...mono10, color: "#2a2f3a" }}>Click "interpret" to analyze via Ollama</div>}
-          </div>
+          <InterpretBtn i={i} j={j} score={score}
+            chunkA={chunkA} chunkB={chunkB}
+            interpretation={interpretation} status={interpStatus}
+            onInterpret={onInterpret}
+          />
           {/* Drill-down: always available */}
           <DrillDown chunkA={chunkA} chunkB={chunkB} macroLabelA={"A"+(i+1)} macroLabelB={"B"+(j+1)} microSize={microSize || "256"} />
         </div>
@@ -1360,7 +1396,7 @@ function LazyChunkList({ chunks, doc, linksMap, renderFn, onLoadMore }) {
 // DOCUMENT VIEW — side-by-side annotated documents
 // ═══════════════════════════════════════════════════════════════
 
-function DocumentView({ chunksA, chunksB, matrix, interpretations, simThreshold: initThresh }) {
+function DocumentView({ chunksA, chunksB, matrix, interpretations, simThreshold: initThresh, onDrillChunk, drilling, onInterpret, interpStatus }) {
   const leftRef = useRef(null);
   const rightRef = useRef(null);
   const wrapperRef = useRef(null);
@@ -1368,6 +1404,7 @@ function DocumentView({ chunksA, chunksB, matrix, interpretations, simThreshold:
   const forceLoadARef = useRef(null);
   const forceLoadBRef = useRef(null);
   const [activeLink, setActiveLink] = useState(null);
+  const [selectedPair, setSelectedPair] = useState(null); // { doc, idx, aIdx, bIdx, score }
   const tooltipRef = useRef(null);
   const [docThreshold, setDocThreshold] = useState(initThresh || 0.5);
 
@@ -1420,9 +1457,13 @@ function DocumentView({ chunksA, chunksB, matrix, interpretations, simThreshold:
   const handleLinkClick = useCallback((fromDoc, fromIdx, toIdx) => {
     const key = fromDoc === "A" ? ("A" + fromIdx + "-B" + toIdx) : ("B" + fromIdx + "-A" + toIdx);
     setActiveLink(key);
+    const aIdx = fromDoc === "A" ? fromIdx : toIdx;
+    const bIdx = fromDoc === "A" ? toIdx : fromIdx;
+    const sc = matrix[aIdx] ? matrix[aIdx][bIdx] || 0 : 0;
+    setSelectedPair({ aIdx, bIdx, score: sc });
     const targetPanel = fromDoc === "A" ? "B" : "A";
     scrollTo(targetPanel, toIdx);
-  }, [scrollTo]);
+  }, [scrollTo, matrix]);
 
   const handleHover = useCallback((e, link, fromDoc, fromIdx) => {
     const tip = tooltipRef.current;
@@ -1474,7 +1515,7 @@ function DocumentView({ chunksA, chunksB, matrix, interpretations, simThreshold:
           <div style={{
             ...mono9, color: doc === "A" ? "#60a5fa50" : "#f59e4250",
             marginBottom: 4, letterSpacing: 1,
-          }}>{doc}{idx + 1}</div>
+          }}>{doc}{idx + 1} <ChunkDrillBtn doc={doc} idx={idx} onDrill={onDrillChunk} drilling={drilling} /></div>
           <ChunkContent text={text} maxLen={null} fontSize={12} maxHeight={null} />
         </div>
         {/* Margin links */}
@@ -1708,6 +1749,34 @@ function DocumentView({ chunksA, chunksB, matrix, interpretations, simThreshold:
           padding: "8px 12px", maxWidth: 300, zIndex: 30, pointerEvents: "none",
         }} />
       </div>
+
+      {/* Selected pair interpret panel */}
+      {selectedPair && onInterpret && (
+        <div style={{
+          marginTop: 8, background: "#0c0e16", borderRadius: 8, padding: 12,
+          border: "1px solid #818cf815",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ ...mono10, color: "#60a5fa", background: "#60a5fa12", padding: "2px 6px", borderRadius: 3 }}>A{selectedPair.aIdx+1}</span>
+              <span style={{ color: "#3a4050", fontSize: 10 }}>{"\u27F7"}</span>
+              <span style={{ ...mono10, color: "#f59e42", background: "#f59e4212", padding: "2px 6px", borderRadius: 3 }}>B{selectedPair.bIdx+1}</span>
+              <span style={{ ...mono10, color: "#f0c040", fontWeight: 700 }}>{(selectedPair.score*100).toFixed(1)}%</span>
+            </div>
+            <button onClick={() => setSelectedPair(null)} style={{
+              ...mono9, background: "transparent", border: "1px solid #1e2230",
+              color: "#3a4050", borderRadius: 3, padding: "2px 6px", cursor: "pointer",
+            }}>{"\u2715"}</button>
+          </div>
+          <InterpretBtn
+            i={selectedPair.aIdx} j={selectedPair.bIdx} score={selectedPair.score}
+            chunkA={chunksA[selectedPair.aIdx]} chunkB={chunksB[selectedPair.bIdx]}
+            interpretation={interpretations[selectedPair.aIdx+"-"+selectedPair.bIdx]}
+            status={interpStatus ? interpStatus[selectedPair.aIdx+"-"+selectedPair.bIdx] : null}
+            onInterpret={onInterpret}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -1748,7 +1817,7 @@ function DistributionChart({ pairs }) {
 // Nodes = chunks, sequential THEN edges, similarity >50% edges
 // ═══════════════════════════════════════════════════════════════
 
-function GraphView({ chunksA, chunksB, matrix, interpretations, microSize }) {
+function GraphView({ chunksA, chunksB, matrix, interpretations, microSize, onDrillChunk, drilling, onInterpret, interpStatus }) {
   const svgRef = useRef(null);
   const containerRef = useRef(null);
   const simRef = useRef(null);
@@ -2339,6 +2408,7 @@ function GraphView({ chunksA, chunksB, matrix, interpretations, microSize }) {
               ...mono11, fontSize: 14, fontWeight: 700,
               color: selectedNode.doc === "A" ? "#60a5fa" : "#f59e42",
             }}>{selectedNode.label}</span>
+            <ChunkDrillBtn doc={selectedNode.doc} idx={selectedNode.origIdx} onDrill={onDrillChunk} drilling={drilling} />
             <span style={{ ...mono9, color: "#3a4050" }}>
               {simLinks.length} similarity link{simLinks.length !== 1 ? "s" : ""} above threshold
             </span>
@@ -2391,21 +2461,30 @@ function GraphView({ chunksA, chunksB, matrix, interpretations, microSize }) {
                     {/* Side-by-side chunks */}
                     <div style={{ display: "flex", gap: 1 }}>
                       <div style={{ flex: "1 1 50%", minWidth: 0, padding: 10, borderRight: "1px solid #1e2230", overflow: "hidden" }}>
-                        <div style={{ ...mono9, color: selColor, marginBottom: 4, letterSpacing: 1 }}>{selectedNode.label}</div>
+                        <div style={{ ...mono9, color: selColor, marginBottom: 4, letterSpacing: 1 }}>{selectedNode.label} <ChunkDrillBtn doc={selectedNode.doc} idx={selectedNode.origIdx} onDrill={onDrillChunk} drilling={drilling} /></div>
                         <ChunkContent text={selText} maxLen={400} fontSize={11} maxHeight={200} />
                       </div>
                       <div style={{ flex: "1 1 50%", minWidth: 0, padding: 10, overflow: "hidden" }}>
-                        <div style={{ ...mono9, color: otherColor, marginBottom: 4, letterSpacing: 1 }}>{otherId}</div>
+                        <div style={{ ...mono9, color: otherColor, marginBottom: 4, letterSpacing: 1 }}>{otherId} <ChunkDrillBtn doc={otherDoc} idx={otherIdx} onDrill={onDrillChunk} drilling={drilling} /></div>
                         <ChunkContent text={otherText} maxLen={400} fontSize={11} maxHeight={200} />
                       </div>
                     </div>
-                    {/* Interpretation */}
-                    {l.interp && (
-                      <div style={{ padding: "8px 12px", borderTop: "1px solid #1e2230", background: "#0e1018" }}>
-                        <div style={{ ...mono9, color: "#818cf8", letterSpacing: 1, marginBottom: 4 }}>{"\u{1F9E0}"} INTERPRETATION</div>
-                        <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 12, color: "#9ca3af", lineHeight: 1.7, whiteSpace: "pre-wrap" }}>{l.interp}</div>
-                      </div>
-                    )}
+                    {/* Interpretation — triggerable */}
+                    {(() => {
+                      var aIdx = selectedNode.doc === "A" ? selectedNode.origIdx : otherIdx;
+                      var bIdx = selectedNode.doc === "B" ? selectedNode.origIdx : otherIdx;
+                      var pk = aIdx + "-" + bIdx;
+                      return (
+                        <div style={{ padding: "0 12px" }}>
+                          <InterpretBtn i={aIdx} j={bIdx} score={l.score}
+                            chunkA={chunksA[aIdx]} chunkB={chunksB[bIdx]}
+                            interpretation={interpretations[pk]}
+                            status={interpStatus ? interpStatus[pk] : null}
+                            onInterpret={onInterpret}
+                          />
+                        </div>
+                      );
+                    })()}
                     {/* Drill-down */}
                     <div style={{ padding: "0 12px 8px" }}>
                       <DrillDown chunkA={selText} chunkB={otherText}
@@ -2508,7 +2587,73 @@ function App() {
   var nextLevel = nextDrillLevel();
   var prevLevel = prevDrillLevel();
 
-  // ─── Drill All: sub-chunk at next level, replace results ───
+  // ─── Drill one chunk: sub-chunk a single segment, splice into results ───
+  const drillOneChunk = useCallback((doc, idx) => {
+    if (!results || drilling) return;
+    var nxt = nextDrillLevel();
+    if (!nxt) return;
+    setDrilling(true);
+    setTimeout(() => {
+      try {
+        var chunksA = results.chunksA.slice();
+        var chunksB = results.chunksB.slice();
+
+        if (doc === "A") {
+          var subs = subChunk(chunksA[idx], nxt);
+          if (subs.length <= 1) { setDrilling(false); return; } // nothing to split
+          chunksA.splice(idx, 1, ...subs);
+        } else {
+          var subs = subChunk(chunksB[idx], nxt);
+          if (subs.length <= 1) { setDrilling(false); return; }
+          chunksB.splice(idx, 1, ...subs);
+        }
+
+        // Recompute matrix with the expanded array
+        var { matrix: newMat, vocab: newVocab } = computeSimilarityMatrix(chunksA, chunksB);
+        var newPairs = [];
+        for (var i = 0; i < newMat.length; i++)
+          for (var j = 0; j < newMat[0].length; j++)
+            newPairs.push({ i: i, j: j, score: newMat[i][j] });
+        newPairs.sort(function(a, b) { return b.score - a.score; });
+        var scores = newPairs.length > 0 ? newPairs.map(function(p) { return p.score; }) : [0];
+
+        // Push current state
+        setResultsStack(function(prev) { return prev.concat([{ results: results, interpretations: interpretations, interpStatus: interpStatus }]); });
+
+        setResults({
+          chunksA: chunksA, chunksB: chunksB,
+          matrix: newMat, pairs: newPairs, vocabSize: newVocab.length,
+          stats: { avg: scores.reduce(function(a,b){return a+b;},0)/scores.length, max: scores[0], highCount: scores.filter(function(s){return s > 0.3;}).length },
+          drillLevel: results.drillLevel, // keep same level label since it's partial
+          drillLabel: (results.drillLabel || "") + "+",
+        });
+        // Remap interpretations: shift keys for indices after the splice point
+        var newInterps = {};
+        var newStatus = {};
+        Object.keys(interpretations).forEach(function(k) {
+          var parts = k.split("-"); var ai = parseInt(parts[0]); var bj = parseInt(parts[1]);
+          if (doc === "A") {
+            if (ai < idx) newInterps[k] = interpretations[k];
+            else if (ai > idx) { var nk = (ai + subs.length - 1) + "-" + bj; newInterps[nk] = interpretations[k]; }
+            // ai === idx: parent was split, its interpretation is invalidated
+          } else {
+            if (bj < idx) newInterps[k] = interpretations[k];
+            else if (bj > idx) { var nk = ai + "-" + (bj + subs.length - 1); newInterps[nk] = interpretations[k]; }
+          }
+        });
+        Object.keys(interpStatus).forEach(function(k) {
+          if (newInterps[k] !== undefined) newStatus[k] = interpStatus[k];
+        });
+        setInterpretations(newInterps);
+        setInterpStatus(newStatus);
+        setSelectedCell(null);
+        setExpandedMatch(0);
+      } catch (err) { console.error("Drill one error:", err); }
+      setDrilling(false);
+    }, 30);
+  }, [results, drilling, interpretations, interpStatus]);
+
+  // ─── Drill All: sub-chunk every chunk at next level ───
   const drillAll = useCallback(() => {
     if (!results || drilling) return;
     var nxt = nextDrillLevel();
@@ -2903,14 +3048,23 @@ function App() {
                     </div>
                     <div style={{ display: "flex", gap: 12 }}>
                       <div style={{ flex: "1 1 50%", minWidth: 0, borderLeft: "3px solid #60a5fa20", padding: "8px 12px", overflow: "hidden" }}>
-                        <div style={{ ...mono9, color: "#60a5fa", marginBottom: 6 }}>DOC A {"\u00B7"} CHUNK {selectedCell[0]+1}</div>
+                        <div style={{ ...mono9, color: "#60a5fa", marginBottom: 6 }}>DOC A {"\u00B7"} CHUNK {selectedCell[0]+1} <ChunkDrillBtn doc="A" idx={selectedCell[0]} onDrill={drillOneChunk} drilling={drilling} /></div>
                         <ChunkContent text={results.chunksA[selectedCell[0]]} maxLen={400} fontSize={12} />
                       </div>
                       <div style={{ flex: "1 1 50%", minWidth: 0, borderLeft: "3px solid #f59e4220", padding: "8px 12px", overflow: "hidden" }}>
-                        <div style={{ ...mono9, color: "#f59e42", marginBottom: 6 }}>DOC B {"\u00B7"} CHUNK {selectedCell[1]+1}</div>
+                        <div style={{ ...mono9, color: "#f59e42", marginBottom: 6 }}>DOC B {"\u00B7"} CHUNK {selectedCell[1]+1} <ChunkDrillBtn doc="B" idx={selectedCell[1]} onDrill={drillOneChunk} drilling={drilling} /></div>
                         <ChunkContent text={results.chunksB[selectedCell[1]]} maxLen={400} fontSize={12} />
                       </div>
                     </div>
+                    <InterpretBtn
+                      i={selectedCell[0]} j={selectedCell[1]}
+                      score={results.matrix[selectedCell[0]][selectedCell[1]]}
+                      chunkA={results.chunksA[selectedCell[0]]}
+                      chunkB={results.chunksB[selectedCell[1]]}
+                      interpretation={interpretations[selectedCell[0]+"-"+selectedCell[1]]}
+                      status={interpStatus[selectedCell[0]+"-"+selectedCell[1]]}
+                      onInterpret={interpretPair}
+                    />
                     <DrillDown
                       chunkA={results.chunksA[selectedCell[0]]}
                       chunkB={results.chunksB[selectedCell[1]]}
@@ -2935,8 +3089,10 @@ function App() {
                       isExpanded={expandedMatch === idx}
                       onToggle={() => setExpandedMatch(expandedMatch === idx ? -1 : idx)}
                       interpretation={interpretations[k]} interpStatus={interpStatus[k]}
-                      onInterpret={() => interpretPair(m.i, m.j, m.score, results.chunksA[m.i], results.chunksB[m.j])}
+                      onInterpret={interpretPair}
                       microSize={microSize}
+                      onDrillChunk={drillOneChunk}
+                      drilling={drilling}
                     />
                   );
                 })}
@@ -2950,6 +3106,10 @@ function App() {
                 chunksB={results.chunksB}
                 matrix={results.matrix}
                 interpretations={interpretations}
+                onDrillChunk={drillOneChunk}
+                drilling={drilling}
+                onInterpret={interpretPair}
+                interpStatus={interpStatus}
               />
               </FullscreenPanel>
             )}
@@ -2962,6 +3122,10 @@ function App() {
                 matrix={results.matrix}
                 interpretations={interpretations}
                 microSize={microSize}
+                onDrillChunk={drillOneChunk}
+                drilling={drilling}
+                onInterpret={interpretPair}
+                interpStatus={interpStatus}
               />
               </FullscreenPanel>
             )}
