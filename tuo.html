@@ -186,8 +186,10 @@ function chunkText(text, targetTokens, overlap) {
 }
 
 function chunkDocument(text, mode = "512", macroSize = 2048) {
-  if (mode === "row" || mode === "paragraph") {
-    return isCSV(text) ? chunkByRow(text) : chunkByParagraph(text);
+  if (mode === "row") {
+    if (isCSV(text)) return chunkByRow(text);
+    var sents = splitSentences(text);
+    return sents.length >= 2 ? sents : [text];
   }
   if (mode === "macro") {
     const overlap = Math.floor(macroSize * 0.06);
@@ -199,21 +201,21 @@ function chunkDocument(text, mode = "512", macroSize = 2048) {
 }
 
 function subChunk(text, mode) {
+  // "row" = CSV rows / text sentences (atomic units)
   if (mode === "row") {
-    return isCSV(text) ? chunkByRow(text) : chunkByParagraph(text);
+    if (isCSV(text)) return chunkByRow(text);
+    // Text: sentences are the atomic unit (like rows for CSV)
+    var sents = splitSentences(text);
+    return sents.length >= 2 ? sents : [text];
   }
   var targetTokens = parseInt(mode, 10) || 256;
   if (isCSV(text)) return chunkCSV(text, targetTokens);
 
   // For text: try token-based split first
   var tokenResult = chunkText(text, targetTokens, Math.floor(targetTokens * 0.1));
-  if (tokenResult.length >= 3) return tokenResult;
+  if (tokenResult.length >= 2) return tokenResult;
 
-  // If token split is too coarse, try paragraphs
-  var paraResult = chunkByParagraph(text);
-  if (paraResult.length >= 2) return paraResult;
-
-  // If no paragraph breaks, split by sentences
+  // If token split didn't break it, try sentences
   var sentences = splitSentences(text);
   if (sentences.length >= 2) return sentences;
 
@@ -396,7 +398,7 @@ function exportHTML(results, interpretations) {
       }
     }
     var ds = text.slice(0, 600);
-    return '<div style="font-family:IBM Plex Serif,serif;font-size:12px;color:#9ca3af;line-height:1.7;max-height:260px;overflow:auto;">'+esc(ds)+(text.length > 600 ? "\u2026" : "")+'<\/div>';
+    return '<div style="font-family:IBM Plex Serif,serif;font-size:12px;color:#9ca3af;line-height:1.7;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;">'+esc(ds)+(text.length > 600 ? "\u2026" : "")+'<\/div>';
   }
 
   // ─── Build sections ───
@@ -443,7 +445,7 @@ function exportHTML(results, interpretations) {
     if (interp) {
       matchCards += '<div style="background:#0c0e16;border-radius:6px;padding:10px;border:1px solid #818cf815;">';
       matchCards += '<div style="font-family:JetBrains Mono,monospace;font-size:8px;color:#818cf8;margin-bottom:4px;">\u{1F9E0} INTERPRETATION<\/div>';
-      matchCards += '<div style="font-family:IBM Plex Serif,serif;font-size:12px;color:#b0b8c8;line-height:1.7;">'+esc(interp)+'<\/div><\/div>';
+      matchCards += '<div style="font-family:IBM Plex Serif,serif;font-size:12px;color:#b0b8c8;line-height:1.7;white-space:pre-wrap;">'+esc(interp)+'<\/div><\/div>';
     }
     matchCards += '<\/div>';
   });
@@ -736,7 +738,7 @@ function ChunkContent({ text, maxLen = 600, fontSize = 12.5, maxHeight = 260 }) 
   return (
     <div style={{
       fontFamily: "'IBM Plex Serif', Georgia, serif", fontSize, color: "#9ca3af",
-      lineHeight: 1.7, maxHeight, overflow: "auto",
+      lineHeight: 1.7, maxHeight, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word",
       scrollbarWidth: "thin", scrollbarColor: "#2a2f3a #0e1018",
     }}>
       {display}{truncated ? "\u2026" : ""}
@@ -1129,7 +1131,7 @@ function MatchCard({ rank, i, j, score, chunkA, chunkB, isExpanded, onToggle, in
               </div>
             )}
             {interpStatus === "error" && <div style={{ ...mono10, color: "#f87171", lineHeight: 1.6 }}>Could not reach Ollama. Ensure it is running at the configured URL.</div>}
-            {interpretation && interpStatus !== "loading" && <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 13, color: "#b0b8c8", lineHeight: 1.8 }}>{interpretation}</div>}
+            {interpretation && interpStatus !== "loading" && <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 13, color: "#b0b8c8", lineHeight: 1.8, whiteSpace: "pre-wrap" }}>{interpretation}</div>}
             {!interpretation && interpStatus !== "loading" && interpStatus !== "error" && <div style={{ ...mono10, color: "#2a2f3a" }}>Click "interpret" to analyze via Ollama</div>}
           </div>
           {/* Drill-down: always available */}
@@ -1172,7 +1174,7 @@ function DrillDown({ chunkA, chunkB, macroLabelA, macroLabelB, microSize }) {
           background: "#34d39920", border: "1px solid #34d39940",
           color: "#34d399", borderRadius: 5, padding: "8px 20px",
           cursor: "pointer",
-        }}>{"\u{1F50D}"} Drill Down {"\u2014"} {microSize === "row" ? "row / paragraph" : microSize + " tokens"}</button>
+        }}>{"\u{1F50D}"} Drill Down {"\u2014"} {microSize === "row" ? "row / sentence" : microSize + " tokens"}</button>
         <div style={{ ...mono9, color: "#2a2f3a", marginTop: 6 }}>
           Sub-chunks this pair for fine-grained comparison
         </div>
@@ -1443,7 +1445,7 @@ function DocumentView({ chunksA, chunksB, matrix, interpretations, simThreshold:
       + '<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:#f0c040;font-weight:700">' + (link.score * 100).toFixed(1) + '%</span>'
       + '</div>'
       + (link.interp
-        ? '<div style="font-family:IBM Plex Serif,serif;font-size:11.5px;color:#b0b8c8;line-height:1.7">' + link.interp.replace(/</g, "&lt;") + '</div>'
+        ? '<div style="font-family:IBM Plex Serif,serif;font-size:11.5px;color:#b0b8c8;line-height:1.7;white-space:pre-wrap">' + link.interp.replace(/</g, "&lt;") + '</div>'
         : '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#3a4050">No LLM interpretation yet</div>');
   }, []);
 
@@ -2131,7 +2133,7 @@ function GraphView({ chunksA, chunksB, matrix, interpretations, microSize }) {
         var col = d.doc === "A" ? "#60a5fa" : "#f59e42";
         var txt = d.text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
         tip.innerHTML = '<div style="font-family:JetBrains Mono,monospace;font-size:11px;color:' + col + ';margin-bottom:4px;font-weight:600;">' + d.label + '</div>'
-          + '<div style="font-family:IBM Plex Serif,serif;font-size:11px;color:#8a8f9c;line-height:1.5;max-height:150px;overflow:auto;">' + txt + '\u2026</div>';
+          + '<div style="font-family:IBM Plex Serif,serif;font-size:11px;color:#8a8f9c;line-height:1.5;max-height:150px;overflow:auto;white-space:pre-wrap;word-break:break-word;">' + txt + '\u2026</div>';
       })
       .on("mouseout", () => {
         if (graphTooltipRef.current) graphTooltipRef.current.style.display = "none";
@@ -2401,7 +2403,7 @@ function GraphView({ chunksA, chunksB, matrix, interpretations, microSize }) {
                     {l.interp && (
                       <div style={{ padding: "8px 12px", borderTop: "1px solid #1e2230", background: "#0e1018" }}>
                         <div style={{ ...mono9, color: "#818cf8", letterSpacing: 1, marginBottom: 4 }}>{"\u{1F9E0}"} INTERPRETATION</div>
-                        <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 12, color: "#9ca3af", lineHeight: 1.7 }}>{l.interp}</div>
+                        <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 12, color: "#9ca3af", lineHeight: 1.7, whiteSpace: "pre-wrap" }}>{l.interp}</div>
                       </div>
                     )}
                     {/* Drill-down */}
@@ -2467,62 +2469,92 @@ function App() {
         setResults({
           chunksA: cA, chunksB: cB, matrix, pairs, vocabSize: vocab.length,
           stats: { avg: scores.reduce((a,b) => a+b, 0)/scores.length, max: scores[0], highCount: scores.filter(s => s > 0.3).length },
-          drillLabel: chunkMode === "macro" ? "Macro " + macroSize : chunkMode === "row" ? "Row/Para" : chunkMode + " tok",
+          drillLevel: chunkMode === "macro" ? String(macroSize) : chunkMode === "row" ? "row" : chunkMode,
+          drillLabel: chunkMode === "macro" ? "Macro " + macroSize : chunkMode === "row" ? "Row/Sent" : chunkMode + " tok",
         });
       } catch (err) { console.error(err); }
       setProcessing(false);
     }, 50);
   }, [textA, textB, chunkMode, macroSize]);
 
-  // ─── Drill All: sub-chunk every chunk at micro level, replace results ───
+  // ─── Drill Ladder: automatic level progression ───
+  const DRILL_LADDER = ["4096", "2048", "1024", "512", "256", "128", "row"];
+  const DRILL_LABELS = { "4096": "4096 tok", "2048": "2048 tok", "1024": "1024 tok", "512": "512 tok", "256": "256 tok", "128": "128 tok", "row": "Row/Sent" };
+
+  // Figure out what level the current results are at
+  function currentDrillLevel() {
+    if (!results || !results.drillLevel) {
+      // Initial level: find closest match in ladder
+      if (chunkMode === "macro") return DRILL_LADDER.indexOf(String(macroSize)) >= 0 ? String(macroSize) : "2048";
+      if (chunkMode === "row") return "row";
+      return DRILL_LADDER.indexOf(chunkMode) >= 0 ? chunkMode : "512";
+    }
+    return results.drillLevel;
+  }
+
+  function nextDrillLevel() {
+    var cur = currentDrillLevel();
+    var idx = DRILL_LADDER.indexOf(cur);
+    if (idx < 0) idx = DRILL_LADDER.indexOf("512"); // fallback
+    return idx < DRILL_LADDER.length - 1 ? DRILL_LADDER[idx + 1] : null;
+  }
+
+  function prevDrillLevel() {
+    if (resultsStack.length === 0) return null;
+    var prev = resultsStack[resultsStack.length - 1];
+    return prev.results.drillLevel || "512";
+  }
+
+  var nextLevel = nextDrillLevel();
+  var prevLevel = prevDrillLevel();
+
+  // ─── Drill All: sub-chunk at next level, replace results ───
   const drillAll = useCallback(() => {
     if (!results || drilling) return;
+    var nxt = nextDrillLevel();
+    if (!nxt) return; // already at finest
     setDrilling(true);
     setTimeout(() => {
       try {
-        // Sub-chunk each existing chunk
         const subChunksA = [];
-        const chunkMapA = []; // maps sub-index back to parent
+        const chunkMapA = [];
         results.chunksA.forEach((c, pi) => {
-          const subs = subChunk(c, microSize);
+          const subs = subChunk(c, nxt);
           subs.forEach(s => { chunkMapA.push(pi); subChunksA.push(s); });
         });
         const subChunksB = [];
         const chunkMapB = [];
         results.chunksB.forEach((c, pi) => {
-          const subs = subChunk(c, microSize);
+          const subs = subChunk(c, nxt);
           subs.forEach(s => { chunkMapB.push(pi); subChunksB.push(s); });
         });
 
-        // Recompute similarity matrix on sub-chunks
         const { matrix: newMat, vocab: newVocab } = computeSimilarityMatrix(subChunksA, subChunksB);
         const newPairs = [];
         for (let i = 0; i < newMat.length; i++)
           for (let j = 0; j < newMat[0].length; j++)
             newPairs.push({ i, j, score: newMat[i][j] });
         newPairs.sort((a, b) => b.score - a.score);
-        const scores = newPairs.map(p => p.score);
+        const scores = newPairs.length > 0 ? newPairs.map(p => p.score) : [0];
 
-        // Push current state onto stack
         setResultsStack(prev => [...prev, { results, interpretations, interpStatus }]);
 
-        // Replace results
         setResults({
           chunksA: subChunksA, chunksB: subChunksB,
           matrix: newMat, pairs: newPairs, vocabSize: newVocab.length,
           stats: { avg: scores.reduce((a,b) => a+b, 0)/scores.length, max: scores[0], highCount: scores.filter(s => s > 0.3).length },
           parentMapA: chunkMapA, parentMapB: chunkMapB,
-          drillLabel: microSize === "row" ? "Row/Para" : microSize + " tok",
+          drillLevel: nxt,
+          drillLabel: DRILL_LABELS[nxt] || nxt,
         });
         setSelectedCell(null);
         setExpandedMatch(0);
-        // Preserve interpretations that can be mapped (clear for fresh level)
         setInterpretations({});
         setInterpStatus({});
       } catch (err) { console.error("Drill error:", err); }
       setDrilling(false);
     }, 50);
-  }, [results, microSize, drilling, interpretations, interpStatus]);
+  }, [results, drilling, interpretations, interpStatus]);
 
   // ─── Drill Up: pop the stack ───
   const drillUp = useCallback(() => {
@@ -2537,6 +2569,7 @@ function App() {
   }, [resultsStack]);
 
   const drillDepth = resultsStack.length;
+  const atFinest = !nextLevel;
 
   const interpretPair = useCallback(async (i, j, score, cA, cB) => {
     const k = i+"-"+j;
@@ -2609,7 +2642,7 @@ function App() {
             <select value={chunkMode} onChange={e => setChunkMode(e.target.value)}
               style={{ background: "#141822", border: "1px solid #1e2230", color: "#9ca3af", borderRadius: 4, padding: "4px 8px", ...mono11, cursor: "pointer", outline: "none" }}>
               <option value="macro">Macro (drill-down)</option>
-              <option value="row">Row / Paragraph</option>
+              <option value="row">Row / Sentence</option>
               <option value="256">256 tok</option>
               <option value="512">512 tok</option>
               <option value="768">768 tok</option>
@@ -2633,7 +2666,7 @@ function App() {
             <label style={{ ...mono9, color: "#818cf8", letterSpacing: 1 }}>DRILL</label>
             <select value={microSize} onChange={e => setMicroSize(e.target.value)}
               style={{ background: "#141822", border: "1px solid #818cf830", color: "#818cf8", borderRadius: 4, padding: "3px 6px", ...mono10, cursor: "pointer", outline: "none" }}>
-              <option value="row">Row / Paragraph</option>
+              <option value="row">Row / Sentence</option>
               <option value="128">128</option>
               <option value="256">256</option>
               <option value="384">384</option>
@@ -2757,46 +2790,67 @@ function App() {
               ))}
             </div>
 
-            {/* Drill level controls */}
+            {/* Drill ladder */}
             <div style={{
-              display: "flex", alignItems: "center", gap: 10, marginBottom: 16,
+              display: "flex", alignItems: "center", gap: 8, marginBottom: 16,
               background: "#0c0e16", borderRadius: 8, padding: "8px 14px", border: "1px solid #1e2230",
               flexWrap: "wrap",
             }}>
               <span style={{ ...mono9, color: "#34d399", letterSpacing: 1 }}>{"\u{1F50D}"} DRILL</span>
 
-              {/* Depth indicator */}
-              <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-                {Array.from({ length: drillDepth + 1 }, (_, i) => (
-                  <div key={i} style={{
-                    width: i === drillDepth ? 10 : 6, height: i === drillDepth ? 10 : 6,
-                    borderRadius: "50%",
-                    background: i === drillDepth ? "#34d399" : "#34d39940",
-                    border: "1px solid #34d39960",
-                    transition: "all 0.2s",
-                  }} />
-                ))}
-                <span style={{ ...mono9, color: "#34d39960", marginLeft: 4 }}>
-                  Level {drillDepth} {"\u00B7"} {results?.drillLabel || ""}
-                </span>
+              {/* Ladder visualization */}
+              <div style={{ display: "flex", alignItems: "center", gap: 0 }}>
+                {DRILL_LADDER.map((lvl, idx) => {
+                  var curLvl = currentDrillLevel();
+                  var curIdx = DRILL_LADDER.indexOf(curLvl);
+                  var isCurrent = lvl === curLvl;
+                  var isVisited = idx < curIdx; // levels we've drilled through
+                  var isFuture = idx > curIdx;
+                  var isNext = nextLevel === lvl;
+                  return (
+                    <div key={lvl} style={{ display: "flex", alignItems: "center" }}>
+                      {idx > 0 && (
+                        <div style={{
+                          width: 12, height: 2,
+                          background: isVisited ? "#34d39960" : isCurrent || isNext ? "#34d39930" : "#1e2230",
+                        }} />
+                      )}
+                      <div style={{
+                        ...mono9, fontSize: 8,
+                        padding: isCurrent ? "3px 8px" : "2px 6px",
+                        borderRadius: isCurrent ? 4 : 10,
+                        background: isCurrent ? "#34d39930" : isVisited ? "#34d39915" : "transparent",
+                        border: "1px solid " + (isCurrent ? "#34d399" : isNext ? "#34d39950" : isVisited ? "#34d39930" : "#1e2230"),
+                        color: isCurrent ? "#34d399" : isVisited ? "#34d39980" : isNext ? "#34d39960" : "#2a2f3a",
+                        fontWeight: isCurrent ? 700 : 400,
+                        transition: "all 0.2s",
+                      }}>{DRILL_LABELS[lvl]}</div>
+                    </div>
+                  );
+                })}
               </div>
 
-              {/* Drill All button */}
-              <button
-                onClick={drillAll}
-                disabled={!results || drilling}
-                style={{
-                  ...mono10, fontWeight: 600, letterSpacing: 1,
-                  background: results && !drilling ? "#34d39920" : "#141822",
-                  border: "1px solid " + (results && !drilling ? "#34d39950" : "#1e2230"),
-                  color: results && !drilling ? "#34d399" : "#3a4050",
-                  borderRadius: 5, padding: "5px 14px",
-                  cursor: results && !drilling ? "pointer" : "not-allowed",
-                  transition: "all 0.2s",
-                }}
-              >
-                {drilling ? "\u27F3 Drilling..." : "\u25B6 Drill All \u2193"}
-              </button>
+              {/* Drill Down button */}
+              {nextLevel && (
+                <button
+                  onClick={drillAll}
+                  disabled={drilling}
+                  style={{
+                    ...mono10, fontWeight: 600, letterSpacing: 1,
+                    background: !drilling ? "#34d39920" : "#141822",
+                    border: "1px solid " + (!drilling ? "#34d39950" : "#1e2230"),
+                    color: !drilling ? "#34d399" : "#3a4050",
+                    borderRadius: 5, padding: "5px 14px",
+                    cursor: !drilling ? "pointer" : "not-allowed",
+                    transition: "all 0.2s",
+                  }}
+                >
+                  {drilling ? "\u27F3 Drilling..." : "\u25BC " + DRILL_LABELS[nextLevel]}
+                </button>
+              )}
+              {atFinest && (
+                <span style={{ ...mono9, color: "#34d39950" }}>{"\u2713"} finest level</span>
+              )}
 
               {/* Drill Up button */}
               {drillDepth > 0 && (
@@ -2804,13 +2858,12 @@ function App() {
                   ...mono10, fontWeight: 600, letterSpacing: 1,
                   background: "#f59e4220", border: "1px solid #f59e4250",
                   color: "#f59e42", borderRadius: 5, padding: "5px 14px", cursor: "pointer",
-                }}>{"\u25B2"} Drill Up</button>
+                }}>{"\u25B2"} {DRILL_LABELS[prevLevel] || "Up"}</button>
               )}
 
-              {/* Info */}
+              {/* Pair count */}
               <span style={{ ...mono9, color: "#2a2f3a", marginLeft: "auto" }}>
-                {results ? results.chunksA.length + " \u00D7 " + results.chunksB.length + " = " + (results.chunksA.length * results.chunksB.length) + " pairs" : ""}
-                {drillDepth > 0 ? " \u00B7 drill up to restore parent view" : " \u00B7 drill to sub-chunk all pairs at micro level"}
+                {results ? results.chunksA.length + "\u00D7" + results.chunksB.length : ""}
               </span>
             </div>
 
