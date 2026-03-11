@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Dupliq</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Serif:wght@400;500&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0a0c12; overflow-x: hidden; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #0a0c12; }
+  ::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 3px; }
+  textarea::-webkit-scrollbar-thumb { background: #2a2f3a; }
+  @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useMemo, useRef } = React;
+
+// ═══════════════════════════════════════════════════════════════
+// NLP UTILITIES
+// ═══════════════════════════════════════════════════════════════
+
+function tokenize(text) {
+  return text.toLowerCase().replace(/[^a-z0-9\s'-]/g, " ").split(/\s+/).filter(t => t.length > 1);
+}
+
+const STOP_WORDS = new Set([
+  "the","be","to","of","and","a","in","that","have","i","it","for","not","on",
+  "with","he","as","you","do","at","this","but","his","by","from","they","we",
+  "say","her","she","or","an","will","my","one","all","would","there","their",
+  "what","so","up","out","if","about","who","get","which","go","me","when",
+  "make","can","like","time","no","just","him","know","take","people","into",
+  "year","your","good","some","could","them","see","other","than","then","now",
+  "look","only","come","its","over","think","also","back","after","use","two",
+  "how","our","work","first","well","way","even","new","want","because","any",
+  "these","give","day","most","us","is","was","are","were","been","has","had",
+  "did","does","am","being","more","very","much","such","own","same","should",
+]);
+
+function removeStopWords(tokens) { return tokens.filter(t => !STOP_WORDS.has(t)); }
+
+function splitSentences(text) {
+  const raw = text.match(/[^.!?\n]+[.!?\n]*/g) || [text];
+  return raw.map(s => s.trim()).filter(s => s.length > 0);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CSV-AWARE CHUNKING
+// ═══════════════════════════════════════════════════════════════
+
+function isCSV(text) {
+  const lines = text.split("\n").filter(l => l.trim().length > 0);
+  if (lines.length < 3) return false;
+  const delim = lines[0].includes("\t") ? "\t" : ",";
+  const headerCount = lines[0].split(delim).length;
+  if (headerCount < 2) return false;
+  let consistent = 0;
+  for (let i = 1; i < Math.min(lines.length, 8); i++) {
+    if (Math.abs(lines[i].split(delim).length - headerCount) <= 1) consistent++;
+  }
+  return consistent >= Math.min(lines.length - 1, 4);
+}
+
+function parseCSVLines(text) {
+  const rows = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"') {
+      if (inQuotes && i + 1 < text.length && text[i + 1] === '"') { current += '"'; i++; }
+      else { inQuotes = !inQuotes; current += ch; }
+    } else if ((ch === "\n" || ch === "\r") && !inQuotes) {
+      if (ch === "\r" && i + 1 < text.length && text[i + 1] === "\n") i++;
+      if (current.trim().length > 0) rows.push(current);
+      current = "";
+    } else { current += ch; }
+  }
+  if (current.trim().length > 0) rows.push(current);
+  return rows;
+}
+
+function chunkCSV(text, targetTokens) {
+  const rows = parseCSVLines(text);
+  if (rows.length === 0) return [text];
+  const header = rows[0];
+  const headerTok = tokenize(header).length;
+  const dataRows = rows.slice(1);
+  const chunks = [];
+  let cur = [], curLen = headerTok;
+  for (const row of dataRows) {
+    const rTok = tokenize(row).length;
+    if (curLen + rTok > targetTokens && cur.length > 0) {
+      chunks.push(header + "\n" + cur.join("\n"));
+      cur = []; curLen = headerTok;
+    }
+    cur.push(row); curLen += rTok;
+  }
+  if (cur.length > 0) chunks.push(header + "\n" + cur.join("\n"));
+  return chunks.length > 0 ? chunks : [text];
+}
+
+function chunkText(text, targetTokens, overlap) {
+  const sentences = splitSentences(text);
+  const chunks = [];
+  let current = [], currentLen = 0;
+  for (const sentence of sentences) {
+    const stk = tokenize(sentence).length;
+    if (currentLen + stk > targetTokens && current.length > 0) {
+      chunks.push(current.join(" "));
+      let oLen = 0, oStart = current.length;
+      for (let i = current.length - 1; i >= 0; i--) {
+        oLen += tokenize(current[i]).length;
+        if (oLen >= overlap) { oStart = i; break; }
+      }
+      current = current.slice(oStart);
+      currentLen = current.reduce((a, s) => a + tokenize(s).length, 0);
+    }
+    current.push(sentence); currentLen += stk;
+  }
+  if (current.length > 0) chunks.push(current.join(" "));
+  return chunks;
+}
+
+function chunkDocument(text, targetTokens = 512, overlap = 64) {
+  return isCSV(text) ? chunkCSV(text, targetTokens) : chunkText(text, targetTokens, overlap);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TF-IDF + COSINE SIMILARITY
+// ═══════════════════════════════════════════════════════════════
+
+function buildVocabulary(allChunks) {
+  const df = {}, N = allChunks.length;
+  allChunks.forEach(chunk => {
+    new Set(removeStopWords(tokenize(chunk))).forEach(t => { df[t] = (df[t] || 0) + 1; });
+  });
+  const vocab = Object.keys(df).filter(t => df[t] > 1 && df[t] < N * 0.85);
+  const idf = {};
+  vocab.forEach(t => { idf[t] = Math.log(N / df[t]) + 1; });
+  return { vocab, idf };
+}
+
+function tfidfVector(chunk, vocab, idf) {
+  const tokens = removeStopWords(tokenize(chunk));
+  const tf = {};
+  tokens.forEach(t => { tf[t] = (tf[t] || 0) + 1; });
+  const maxTf = Math.max(...Object.values(tf), 1);
+  const vec = new Float64Array(vocab.length);
+  vocab.forEach((t, i) => { if (tf[t]) vec[i] = (0.5 + 0.5 * tf[t] / maxTf) * (idf[t] || 0); });
+  return vec;
+}
+
+function cosineSimilarity(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
+  const d = Math.sqrt(na) * Math.sqrt(nb);
+  return d === 0 ? 0 : dot / d;
+}
+
+function computeSimilarityMatrix(chunksA, chunksB) {
+  const all = [...chunksA, ...chunksB];
+  const { vocab, idf } = buildVocabulary(all);
+  const vA = chunksA.map(c => tfidfVector(c, vocab, idf));
+  const vB = chunksB.map(c => tfidfVector(c, vocab, idf));
+  const matrix = vA.map(a => vB.map(b => cosineSimilarity(a, b)));
+  return { matrix, vocab, idf };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OLLAMA INTEGRATION
+// ═══════════════════════════════════════════════════════════════
+
+async function queryOllama(baseUrl, model, chunkA, chunkB, score, signal) {
+  const prompt = "You are a document analyst. Two text segments from different documents have a "
+    + (score * 100).toFixed(1) + "% lexical similarity score.\n\nSEGMENT A:\n\"\"\"\n"
+    + chunkA.slice(0, 1200) + "\n\"\"\"\n\nSEGMENT B:\n\"\"\"\n"
+    + chunkB.slice(0, 1200) + "\n\"\"\"\n\n"
+    + "Provide a concise analysis (3-5 sentences) covering:\n"
+    + "1. What specific topics, concepts, or claims these segments share\n"
+    + "2. How they differ in perspective, scope, or detail\n"
+    + "3. The nature of their relationship (e.g., redundant, complementary, contradictory, one elaborates the other)\n\n"
+    + "Be direct and specific. No preamble.";
+
+  const resp = await fetch(baseUrl + "/api/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal,
+    body: JSON.stringify({ model, prompt, stream: false, options: { temperature: 0.3, num_predict: 300 } }),
+  });
+  if (!resp.ok) throw new Error("Ollama " + resp.status);
+  const data = await resp.json();
+  return data.response || data.message?.content || "(no response)";
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CSV EXPORT
+// ═══════════════════════════════════════════════════════════════
+
+function escapeCSV(str) {
+  if (!str) return '""';
+  return '"' + String(str).replace(/\r?\n/g, " ").replace(/"/g, '""') + '"';
+}
+
+function exportCSV(results, interpretations) {
+  const rows = ["Rank,Chunk_A,Chunk_B,Similarity_Pct,Chunk_A_Text,Chunk_B_Text,LLM_Interpretation"];
+  results.pairs.slice(0, 50).forEach((m, idx) => {
+    rows.push([idx+1, "A"+(m.i+1), "B"+(m.j+1), (m.score*100).toFixed(2),
+      escapeCSV(results.chunksA[m.i].slice(0,2000)),
+      escapeCSV(results.chunksB[m.j].slice(0,2000)),
+      escapeCSV(interpretations[m.i+"-"+m.j] || ""),
+    ].join(","));
+  });
+  const blob = new Blob(["\uFEFF" + rows.join("\n")], { type: "text/csv;charset=utf-8;" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "dupliq_report_" + new Date().toISOString().slice(0,10) + ".csv";
+  a.click();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// HTML REPORT EXPORT (string concat — no template literals that
+// could break the outer Babel block)
+// ═══════════════════════════════════════════════════════════════
+
+function exportHTML(results, interpretations) {
+  var D = new Date().toISOString().slice(0, 10);
+  var hi = results.pairs.filter(function(p) { return p.score >= 0.5; });
+  var nInterp = hi.filter(function(p) { return !!interpretations[p.i + "-" + p.j]; }).length;
+
+  function esc(s) { return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+  function barCol(v) { return v >= 0.8 ? "#f0c040" : v >= 0.65 ? "#f59e42" : "#818cf8"; }
+
+  function relTag(interp) {
+    if (!interp) return "";
+    var lw = interp.toLowerCase(), tg = [];
+    if (lw.indexOf("redundant") >= 0 || lw.indexOf("overlap") >= 0 || lw.indexOf("duplicate") >= 0) tg.push("Redundant|#f8717118|#f87171");
+    if (lw.indexOf("complementary") >= 0 || lw.indexOf("complement") >= 0) tg.push("Complementary|#34d39918|#34d399");
+    if (lw.indexOf("contradict") >= 0) tg.push("Contradictory|#fb923c18|#fb923c");
+    if (lw.indexOf("elaborat") >= 0) tg.push("Elaboration|#60a5fa18|#60a5fa");
+    if (tg.length === 0) tg.push("Related|#818cf818|#818cf8");
+    return tg.map(function(t) { var p=t.split("|"); return '<span style="display:inline-block;font-family:JetBrains Mono,monospace;font-size:10px;padding:2px 8px;border-radius:3px;background:'+p[1]+';color:'+p[2]+';margin-right:6px;">'+p[0]+'</span>'; }).join("");
+  }
+
+  function statBox(label, val, col) {
+    return '<div style="flex:1;background:#0e1018;padding:16px 12px;text-align:center;">'
+      + '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#3a4050;letter-spacing:1px;margin-bottom:4px;">' + label + '</div>'
+      + '<div style="font-family:JetBrains Mono,monospace;font-size:22px;color:'+col+';font-weight:700;">'+val+'</div></div>';
+  }
+
+  var cards = "";
+  hi.forEach(function(m, idx) {
+    var k = m.i+"-"+m.j, interp = interpretations[k] || null;
+    var pct = (m.score*100).toFixed(1), bc = barCol(m.score);
+    var chA = esc(results.chunksA[m.i].slice(0,800)) + (results.chunksA[m.i].length > 800 ? "\u2026" : "");
+    var chB = esc(results.chunksB[m.j].slice(0,800)) + (results.chunksB[m.j].length > 800 ? "\u2026" : "");
+    var bdr = m.score > 0.7 ? "#f0c04030" : "#1e2230";
+
+    cards += '<div style="background:#0e1018;border-radius:10px;border:1px solid '+bdr+';padding:20px;margin-bottom:16px;page-break-inside:avoid;">';
+    cards += '<div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">';
+    cards += '<div style="font-family:JetBrains Mono,monospace;font-size:22px;color:#2a2f3a;font-weight:700;min-width:40px;">#'+(idx+1)+'</div>';
+    cards += '<div style="flex:1;"><div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">';
+    cards += '<span style="font-family:JetBrains Mono,monospace;font-size:11px;color:#60a5fa;background:#60a5fa12;padding:2px 8px;border-radius:4px;">A'+(m.i+1)+'</span>';
+    cards += '<span style="color:#3a4050;font-size:12px;">\u27F7</span>';
+    cards += '<span style="font-family:JetBrains Mono,monospace;font-size:11px;color:#f59e42;background:#f59e4212;padding:2px 8px;border-radius:4px;">B'+(m.j+1)+'</span>';
+    cards += relTag(interp) + '</div>';
+    cards += '<div style="background:#181c24;border-radius:4px;height:6px;overflow:hidden;"><div style="width:'+pct+'%;height:100%;background:'+bc+';border-radius:4px;"></div></div></div>';
+    cards += '<div style="font-family:JetBrains Mono,monospace;font-size:20px;color:'+bc+';font-weight:700;min-width:65px;text-align:right;">'+pct+'%</div></div>';
+    // chunks
+    cards += '<div style="display:flex;gap:12px;margin-bottom:'+(interp?"14":"0")+'px;">';
+    cards += '<div style="flex:1;background:#141822;border-radius:6px;padding:12px;border-left:3px solid #60a5fa30;">';
+    cards += '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#60a5fa;margin-bottom:6px;letter-spacing:1px;">DOC A \u00B7 CHUNK '+(m.i+1)+'</div>';
+    cards += '<div style="font-family:IBM Plex Serif,Georgia,serif;font-size:12.5px;color:#9ca3af;line-height:1.7;">'+chA+'</div></div>';
+    cards += '<div style="flex:1;background:#141822;border-radius:6px;padding:12px;border-left:3px solid #f59e4230;">';
+    cards += '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#f59e42;margin-bottom:6px;letter-spacing:1px;">DOC B \u00B7 CHUNK '+(m.j+1)+'</div>';
+    cards += '<div style="font-family:IBM Plex Serif,Georgia,serif;font-size:12.5px;color:#9ca3af;line-height:1.7;">'+chB+'</div></div></div>';
+    // interp
+    if (interp) {
+      cards += '<div style="background:#0c0e16;border-radius:6px;padding:14px;border:1px solid #818cf815;">';
+      cards += '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#818cf8;letter-spacing:1px;margin-bottom:8px;">\u{1F9E0} LLM INTERPRETATION</div>';
+      cards += '<div style="font-family:IBM Plex Serif,serif;font-size:13px;color:#b0b8c8;line-height:1.8;">'+esc(interp)+'</div></div>';
+    } else {
+      cards += '<div style="background:#0c0e16;border-radius:6px;padding:10px 14px;border:1px solid #1e2230;">';
+      cards += '<div style="font-family:JetBrains Mono,monospace;font-size:10px;color:#2a2f3a;">No LLM interpretation available</div></div>';
+    }
+    cards += '</div>';
+  });
+
+  var avgH = hi.length > 0 ? (hi.reduce(function(a,p){return a+p.score;},0)/hi.length*100).toFixed(1) : "0.0";
+  var maxS = hi.length > 0 ? (hi[0].score*100).toFixed(1) : "0.0";
+
+  var h = [];
+  h.push('<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" />');
+  h.push('<meta name="viewport" content="width=device-width, initial-scale=1.0" />');
+  h.push('<title>Dupliq Report \u2014 '+D+'<\/title>');
+  h.push('<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Serif:wght@400;500&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />');
+  h.push('<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#0a0c12;color:#c8ccd4;font-family:IBM Plex Sans,system-ui,sans-serif;padding:32px 20px}');
+  h.push('@media print{body{background:#fff;color:#1a1a1a;padding:12px}.no-print{display:none!important}}<\/style>');
+  h.push('<\/head><body><div style="max-width:900px;margin:0 auto;">');
+  // header
+  h.push('<div style="margin-bottom:36px;">');
+  h.push('<div style="font-family:JetBrains Mono,monospace;font-size:10px;letter-spacing:3px;color:#f59e42;text-transform:uppercase;margin-bottom:4px;">DUPLIQ REPORT</div>');
+  h.push('<h1 style="font-family:IBM Plex Sans,sans-serif;font-size:28px;font-weight:300;color:#e8ecf4;margin:0 0 6px;letter-spacing:-0.5px;">Document Similarity Analysis<\/h1>');
+  h.push('<p style="font-family:JetBrains Mono,monospace;font-size:10px;color:#3a4050;">Generated '+D+' &middot; matches &ge; 50% &middot; '+hi.length+' pairs<\/p><\/div>');
+  // stats
+  h.push('<div style="display:flex;gap:1px;margin-bottom:28px;border-radius:8px;overflow:hidden;">');
+  h.push(statBox("MATCHES &ge;50%", hi.length, "#f0c040"));
+  h.push(statBox("AVG", avgH+"%", "#34d399"));
+  h.push(statBox("MAX", maxS+"%", "#f59e42"));
+  h.push(statBox("INTERPRETED", nInterp+"/"+hi.length, "#818cf8"));
+  h.push(statBox("CHUNKS A", results.chunksA.length, "#60a5fa"));
+  h.push(statBox("CHUNKS B", results.chunksB.length, "#f59e42"));
+  h.push('<\/div>');
+  // print
+  h.push('<div class="no-print" style="margin-bottom:24px;">');
+  h.push('<button onclick="window.print()" style="font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;background:#818cf820;border:1px solid #818cf850;color:#818cf8;border-radius:5px;padding:8px 20px;cursor:pointer;">\u{1F5A8} Print / Save PDF<\/button><\/div>');
+  // cards
+  if (hi.length === 0) {
+    h.push('<div style="background:#0e1018;border-radius:10px;padding:40px;text-align:center;">');
+    h.push('<div style="font-family:JetBrains Mono,monospace;font-size:14px;color:#34d399;margin-bottom:8px;">\u2713 No pairs above 50%<\/div><\/div>');
+  } else {
+    h.push('<div style="font-family:JetBrains Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:14px;letter-spacing:1px;">ALL MATCHES &ge; 50% &middot; ranked by score<\/div>');
+    h.push(cards);
+  }
+  // footer
+  h.push('<div style="margin-top:40px;padding-top:16px;border-top:1px solid #1e2230;">');
+  h.push('<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#2a2f3a;text-align:center;">Dupliq &middot; '+D+'<\/div><\/div>');
+  h.push('<\/div><\/body><\/html>');
+
+  var blob = new Blob([h.join("\n")], { type: "text/html;charset=utf-8;" });
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "dupliq_report_" + D + ".html";
+  a.click();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// COLOR + STYLE HELPERS
+// ═══════════════════════════════════════════════════════════════
+
+function simColor(val) {
+  if (val < 0.05) return "rgba(20,24,32,0.95)";
+  const r = Math.round(255 * Math.min(1, val * 2.2));
+  const g = Math.round(180 * Math.min(1, val * 1.1));
+  const b = Math.round(60 + 60 * (1 - val));
+  return "rgba("+r+","+g+","+b+","+(0.3+val*0.7)+")";
+}
+function simTextColor(val) { return val > 0.35 ? "#0a0c10" : "#c8ccd4"; }
+
+const mono9 = { fontFamily: "'JetBrains Mono', monospace", fontSize: 9 };
+const mono10 = { fontFamily: "'JetBrains Mono', monospace", fontSize: 10 };
+const mono11 = { fontFamily: "'JetBrains Mono', monospace", fontSize: 11 };
+
+// ═══════════════════════════════════════════════════════════════
+// REACT COMPONENTS
+// ═══════════════════════════════════════════════════════════════
+
+function FileUpload({ label, color, onTextLoad, text }) {
+  const fileRef = useRef(null);
+  const [dragging, setDragging] = useState(false);
+  const readFile = useCallback(file => {
+    const reader = new FileReader();
+    reader.onload = e => onTextLoad(e.target.result);
+    reader.readAsText(file);
+  }, [onTextLoad]);
+  const handleDrop = useCallback(e => {
+    e.preventDefault(); setDragging(false);
+    if (e.dataTransfer.files[0]) readFile(e.dataTransfer.files[0]);
+  }, [readFile]);
+
+  const csvInfo = text && isCSV(text) ? " \u00B7 CSV detected \u00B7 " + (parseCSVLines(text).length - 1) + " rows" : "";
+
+  return (
+    <div style={{ flex: 1, minWidth: 0 }}>
+      <div style={{ ...mono11, letterSpacing: 2, textTransform: "uppercase", color, marginBottom: 8, fontWeight: 600 }}>{label}</div>
+      <div
+        onDragOver={e => { e.preventDefault(); setDragging(true); }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={handleDrop}
+        onClick={() => !text && fileRef.current?.click()}
+        style={{
+          border: "1.5px dashed " + (dragging ? color : "#2a2f3a"),
+          borderRadius: 8, padding: text ? 0 : 32,
+          background: dragging ? color + "08" : "#0e1018",
+          cursor: text ? "default" : "pointer",
+          transition: "all 0.2s", minHeight: 120,
+        }}
+      >
+        <input ref={fileRef} type="file" accept=".txt,.md,.html,.csv,.json,.xml,.log,.py,.js,.ts,.tex,.rst,.tsv"
+          style={{ display: "none" }}
+          onChange={e => e.target.files[0] && readFile(e.target.files[0])}
+        />
+        {text ? (
+          <div style={{ position: "relative" }}>
+            <textarea value={text} onChange={e => onTextLoad(e.target.value)}
+              style={{
+                width: "100%", minHeight: 160, maxHeight: 280,
+                background: "transparent", color: "#9ca3af",
+                border: "none", resize: "vertical", padding: 14,
+                fontFamily: "'JetBrains Mono', monospace", fontSize: 12,
+                lineHeight: 1.7, outline: "none", boxSizing: "border-box",
+              }}
+            />
+            <button onClick={e => { e.stopPropagation(); onTextLoad(""); }}
+              style={{
+                position: "absolute", top: 8, right: 8,
+                background: "#1a1e28", border: "1px solid " + color + "40",
+                color, borderRadius: 4, padding: "2px 8px", cursor: "pointer", ...mono11,
+              }}>clear</button>
+          </div>
+        ) : (
+          <div style={{ textAlign: "center", color: "#4a5060" }}>
+            <div style={{ fontSize: 28, marginBottom: 8 }}>{"\uD83D\uDCC4"}</div>
+            <div style={mono11}>Drop file or click to upload</div>
+            <div style={{ ...mono10, marginTop: 4, color: "#3a4050" }}>.txt .md .csv .json .xml .py .js</div>
+          </div>
+        )}
+      </div>
+      {text && <div style={{ ...mono10, color: "#4a5060", marginTop: 6 }}>{tokenize(text).length} tokens {"\u00B7"} {text.length} chars{csvInfo}</div>}
+    </div>
+  );
+}
+
+function Heatmap({ matrix, chunksA, chunksB, onCellClick, selectedCell }) {
+  if (!matrix.length) return null;
+  const cellSize = Math.max(16, Math.min(48, Math.floor(600 / Math.max(matrix.length, matrix[0].length))));
+  return (
+    <div style={{ overflowX: "auto", padding: "8px 0" }}>
+      <div style={{ display: "inline-block" }}>
+        <div style={{ display: "flex", marginLeft: cellSize + 20 }}>
+          {chunksB.map((_, j) => (
+            <div key={j} style={{ width: cellSize, textAlign: "center", ...mono9, color: "#4a5568", transform: "rotate(-45deg)", transformOrigin: "center", height: 30 }}>B{j+1}</div>
+          ))}
+        </div>
+        {matrix.map((row, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center" }}>
+            <div style={{ width: 20, ...mono9, color: "#4a5568", textAlign: "right", marginRight: 4 }}>A{i+1}</div>
+            {row.map((val, j) => {
+              const sel = selectedCell && selectedCell[0] === i && selectedCell[1] === j;
+              return (
+                <div key={j} onClick={() => onCellClick([i, j])}
+                  title={"A"+(i+1)+" \u2194 B"+(j+1)+": "+(val*100).toFixed(1)+"%"}
+                  style={{
+                    width: cellSize, height: cellSize, background: simColor(val),
+                    border: sel ? "2px solid #f0c040" : "1px solid #181c24",
+                    borderRadius: 2, cursor: "pointer",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    fontSize: cellSize > 28 ? 9 : 0, ...mono9,
+                    color: simTextColor(val), transition: "all 0.15s", boxSizing: "border-box",
+                  }}>{cellSize > 28 ? (val*100).toFixed(0) : ""}</div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function InterpretBadge({ status }) {
+  if (status === "done") return <span style={{ ...mono9, color: "#34d399", background: "#34d39912", padding: "2px 6px", borderRadius: 3 }}>{"\u2713"} interpreted</span>;
+  if (status === "loading") return <span style={{ ...mono9, color: "#818cf8", animation: "pulse 1.2s infinite" }}>{"\u27F3"} interpreting...</span>;
+  if (status === "error") return <span style={{ ...mono9, color: "#f87171", background: "#f8717112", padding: "2px 6px", borderRadius: 3 }}>{"\u2717"} failed</span>;
+  return null;
+}
+
+function MatchCard({ rank, i, j, score, chunkA, chunkB, isExpanded, onToggle, interpretation, interpStatus, onInterpret }) {
+  const barW = Math.max(4, score * 100);
+  return (
+    <div onClick={onToggle} style={{
+      background: "#0e1018", borderRadius: 8,
+      border: "1px solid " + (score > 0.4 ? "#f0c04030" : "#1e2230"),
+      padding: 16, cursor: "pointer", transition: "all 0.2s",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ ...mono11, fontSize: 20, color: "#2a2f3a", fontWeight: 700, minWidth: 36 }}>#{rank}</div>
+        <div style={{ flex: 1 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+            <span style={{ ...mono11, color: "#60a5fa", background: "#60a5fa12", padding: "2px 8px", borderRadius: 4 }}>A{i+1}</span>
+            <span style={{ color: "#3a4050", fontSize: 12 }}>{"\u27F7"}</span>
+            <span style={{ ...mono11, color: "#f59e42", background: "#f59e4212", padding: "2px 8px", borderRadius: 4 }}>B{j+1}</span>
+            <InterpretBadge status={interpStatus} />
+          </div>
+          <div style={{ background: "#181c24", borderRadius: 4, height: 6, overflow: "hidden" }}>
+            <div style={{ width: barW+"%", height: "100%", background: "linear-gradient(90deg, #f59e42, #f0c040)", borderRadius: 4, transition: "width 0.4s ease" }} />
+          </div>
+        </div>
+        <div style={{
+          ...mono11, fontSize: 18,
+          color: score > 0.4 ? "#f0c040" : score > 0.2 ? "#f59e42" : "#4a5568",
+          fontWeight: 700, minWidth: 60, textAlign: "right",
+        }}>{(score*100).toFixed(1)}%</div>
+      </div>
+      {isExpanded && (
+        <div style={{ marginTop: 16 }}>
+          <div style={{ display: "flex", gap: 12 }}>
+            <div style={{ flex: 1, background: "#141822", borderRadius: 6, padding: 12, borderLeft: "3px solid #60a5fa30" }}>
+              <div style={{ ...mono9, color: "#60a5fa", marginBottom: 6, letterSpacing: 1 }}>DOC A {"\u00B7"} CHUNK {i+1}</div>
+              <div style={{ fontFamily: "'IBM Plex Serif', Georgia, serif", fontSize: 12.5, color: "#9ca3af", lineHeight: 1.7 }}>
+                {chunkA.slice(0, 600)}{chunkA.length > 600 ? "\u2026" : ""}
+              </div>
+            </div>
+            <div style={{ flex: 1, background: "#141822", borderRadius: 6, padding: 12, borderLeft: "3px solid #f59e4230" }}>
+              <div style={{ ...mono9, color: "#f59e42", marginBottom: 6, letterSpacing: 1 }}>DOC B {"\u00B7"} CHUNK {j+1}</div>
+              <div style={{ fontFamily: "'IBM Plex Serif', Georgia, serif", fontSize: 12.5, color: "#9ca3af", lineHeight: 1.7 }}>
+                {chunkB.slice(0, 600)}{chunkB.length > 600 ? "\u2026" : ""}
+              </div>
+            </div>
+          </div>
+          <div style={{ marginTop: 12, background: "#0c0e16", borderRadius: 6, padding: 14, border: "1px solid #818cf815" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+              <div style={{ ...mono9, color: "#818cf8", letterSpacing: 1 }}>{"\u{1F9E0}"} LLM INTERPRETATION</div>
+              {interpStatus !== "loading" && (
+                <button onClick={e => { e.stopPropagation(); onInterpret(); }} style={{
+                  ...mono9, background: "#818cf818", border: "1px solid #818cf830",
+                  color: "#818cf8", borderRadius: 4, padding: "3px 10px", cursor: "pointer",
+                }}>{interpretation ? "\u21BB re-interpret" : "\u25B6 interpret"}</button>
+              )}
+            </div>
+            {interpStatus === "loading" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, color: "#4a5568" }}>
+                <div style={{ width: 14, height: 14, border: "2px solid #818cf840", borderTopColor: "#818cf8", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+                <span style={mono10}>Querying model...</span>
+              </div>
+            )}
+            {interpStatus === "error" && <div style={{ ...mono10, color: "#f87171", lineHeight: 1.6 }}>Could not reach Ollama. Ensure it is running at the configured URL.</div>}
+            {interpretation && interpStatus !== "loading" && <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 13, color: "#b0b8c8", lineHeight: 1.8 }}>{interpretation}</div>}
+            {!interpretation && interpStatus !== "loading" && interpStatus !== "error" && <div style={{ ...mono10, color: "#2a2f3a" }}>Click "interpret" to analyze via Ollama</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DistributionChart({ pairs }) {
+  const buckets = useMemo(() => {
+    const b = Array(20).fill(0);
+    pairs.forEach(p => { b[Math.min(19, Math.floor(p.score * 20))]++; });
+    return b;
+  }, [pairs]);
+  const mx = Math.max(...buckets, 1);
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 180, padding: "0 4px" }}>
+        {buckets.map((count, i) => {
+          const h = Math.max(2, (count / mx) * 160), intensity = i / 19;
+          return (
+            <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end" }}>
+              {count > 0 && <div style={{ ...mono9, fontSize: 8, color: "#4a5568", marginBottom: 2 }}>{count}</div>}
+              <div title={(i*5)+"-"+(i*5+5)+"%: "+count} style={{
+                width: "100%", height: h, borderRadius: "3px 3px 0 0",
+                background: "rgba("+(Math.round(240*intensity+40))+","+(Math.round(160*intensity+60))+","+(Math.round(64+30*(1-intensity)))+","+(0.4+intensity*0.6)+")",
+                transition: "height 0.3s ease",
+              }} />
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", ...mono9, color: "#3a4050", marginTop: 6, padding: "0 4px" }}>
+        <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════
+
+function App() {
+  const [textA, setTextA] = useState("");
+  const [textB, setTextB] = useState("");
+  const [results, setResults] = useState(null);
+  const [processing, setProcessing] = useState(false);
+  const [selectedCell, setSelectedCell] = useState(null);
+  const [expandedMatch, setExpandedMatch] = useState(0);
+  const [tab, setTab] = useState("heatmap");
+  const [chunkTarget, setChunkTarget] = useState(512);
+  const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
+  const [ollamaModel, setOllamaModel] = useState("gptoss29b");
+  const [interpretations, setInterpretations] = useState({});
+  const [interpStatus, setInterpStatus] = useState({});
+  const [batchInterpreting, setBatchInterpreting] = useState(false);
+  const abortRef = useRef(null);
+
+  const canRun = textA.trim().length > 20 && textB.trim().length > 20;
+
+  const analyze = useCallback(() => {
+    setProcessing(true); setResults(null); setSelectedCell(null);
+    setExpandedMatch(0); setInterpretations({}); setInterpStatus({});
+    setTimeout(() => {
+      try {
+        const cA = chunkDocument(textA, chunkTarget, Math.floor(chunkTarget * 0.12));
+        const cB = chunkDocument(textB, chunkTarget, Math.floor(chunkTarget * 0.12));
+        const { matrix, vocab } = computeSimilarityMatrix(cA, cB);
+        const pairs = [];
+        for (let i = 0; i < matrix.length; i++)
+          for (let j = 0; j < matrix[0].length; j++)
+            pairs.push({ i, j, score: matrix[i][j] });
+        pairs.sort((a, b) => b.score - a.score);
+        const scores = pairs.map(p => p.score);
+        setResults({
+          chunksA: cA, chunksB: cB, matrix, pairs, vocabSize: vocab.length,
+          stats: { avg: scores.reduce((a,b) => a+b, 0)/scores.length, max: scores[0], highCount: scores.filter(s => s > 0.3).length },
+        });
+      } catch (err) { console.error(err); }
+      setProcessing(false);
+    }, 50);
+  }, [textA, textB, chunkTarget]);
+
+  const interpretPair = useCallback(async (i, j, score, cA, cB) => {
+    const k = i+"-"+j;
+    setInterpStatus(p => ({ ...p, [k]: "loading" }));
+    try {
+      const r = await queryOllama(ollamaUrl, ollamaModel, cA, cB, score);
+      setInterpretations(p => ({ ...p, [k]: r }));
+      setInterpStatus(p => ({ ...p, [k]: "done" }));
+    } catch (err) { setInterpStatus(p => ({ ...p, [k]: "error" })); }
+  }, [ollamaUrl, ollamaModel]);
+
+  const batchInterpret = useCallback(async (count) => {
+    if (!results) return;
+    setBatchInterpreting(true);
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    for (const m of results.pairs.slice(0, count)) {
+      if (ctrl.signal.aborted) break;
+      const k = m.i+"-"+m.j;
+      if (interpretations[k]) continue;
+      setInterpStatus(p => ({ ...p, [k]: "loading" }));
+      try {
+        const r = await queryOllama(ollamaUrl, ollamaModel, results.chunksA[m.i], results.chunksB[m.j], m.score, ctrl.signal);
+        setInterpretations(p => ({ ...p, [k]: r }));
+        setInterpStatus(p => ({ ...p, [k]: "done" }));
+      } catch (err) {
+        if (err.name === "AbortError") break;
+        setInterpStatus(p => ({ ...p, [k]: "error" }));
+      }
+    }
+    setBatchInterpreting(false);
+  }, [results, ollamaUrl, ollamaModel, interpretations]);
+
+  const topMatches = results ? results.pairs.slice(0, 20) : [];
+  const interpretedCount = Object.values(interpStatus).filter(s => s === "done").length;
+
+  const actBtn = (on, accent="#818cf8") => ({
+    ...mono10, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase",
+    background: on ? accent+"20" : "#141822", border: "1px solid "+(on ? accent+"50" : "#1e2230"),
+    color: on ? accent : "#4a5568", borderRadius: 5, padding: "7px 16px",
+    cursor: on ? "pointer" : "not-allowed", transition: "all 0.2s",
+  });
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#0a0c12", color: "#c8ccd4", padding: "24px 20px", fontFamily: "'IBM Plex Sans', system-ui, sans-serif" }}>
+      <div style={{ maxWidth: 960, margin: "0 auto" }}>
+
+        <div style={{ marginBottom: 32 }}>
+          <div style={{ ...mono10, letterSpacing: 3, color: "#f59e42", textTransform: "uppercase", marginBottom: 4 }}>VECTOR ANALYSIS</div>
+          <h1 style={{ fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 28, fontWeight: 300, color: "#e8ecf4", margin: 0, letterSpacing: -0.5 }}>Dupliq</h1>
+          <p style={{ ...mono10, color: "#3a4050", marginTop: 6 }}>
+            TF-IDF embeddings {"\u00B7"} cosine similarity {"\u00B7"} Ollama LLM interpretation {"\u00B7"} CSV + HTML export
+          </p>
+        </div>
+
+        <div style={{ display: "flex", gap: 16, marginBottom: 20 }}>
+          <FileUpload label="Document A" color="#60a5fa" onTextLoad={setTextA} text={textA} />
+          <FileUpload label="Document B" color="#f59e42" onTextLoad={setTextB} text={textB} />
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <label style={{ ...mono10, color: "#4a5568", letterSpacing: 1 }}>CHUNKS</label>
+            <select value={chunkTarget} onChange={e => setChunkTarget(Number(e.target.value))}
+              style={{ background: "#141822", border: "1px solid #1e2230", color: "#9ca3af", borderRadius: 4, padding: "4px 8px", ...mono11, cursor: "pointer", outline: "none" }}>
+              <option value={256}>256 tok</option>
+              <option value={512}>512 tok</option>
+              <option value={768}>768 tok</option>
+              <option value={1024}>1024 tok</option>
+            </select>
+          </div>
+          <button onClick={analyze} disabled={!canRun || processing} style={{
+            ...mono11, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase",
+            background: canRun && !processing ? "linear-gradient(135deg, #f59e42, #f0c040)" : "#1a1e28",
+            color: canRun && !processing ? "#0a0c12" : "#3a4050",
+            border: "none", borderRadius: 6, padding: "10px 28px",
+            cursor: canRun && !processing ? "pointer" : "not-allowed", transition: "all 0.2s",
+          }}>{processing ? "\u27F3 Computing\u2026" : "\u25B6 Analyze"}</button>
+        </div>
+
+        <div style={{
+          display: "flex", alignItems: "center", gap: 10, marginBottom: 32, flexWrap: "wrap",
+          background: "#0e1018", borderRadius: 8, padding: "10px 14px", border: "1px solid #1e2230",
+        }}>
+          <div style={{ ...mono9, color: "#818cf8", letterSpacing: 1, marginRight: 4 }}>{"\u{1F9E0}"} OLLAMA</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <label style={{ ...mono9, color: "#3a4050" }}>URL</label>
+            <input value={ollamaUrl} onChange={e => setOllamaUrl(e.target.value)} style={{
+              background: "#141822", border: "1px solid #1e2230", color: "#9ca3af",
+              borderRadius: 4, padding: "4px 8px", ...mono10, outline: "none", width: 200,
+            }} />
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <label style={{ ...mono9, color: "#3a4050" }}>MODEL</label>
+            <input value={ollamaModel} onChange={e => setOllamaModel(e.target.value)} style={{
+              background: "#141822", border: "1px solid #1e2230", color: "#9ca3af",
+              borderRadius: 4, padding: "4px 8px", ...mono10, outline: "none", width: 140,
+            }} />
+          </div>
+          {results && !batchInterpreting && <>
+            <button onClick={() => batchInterpret(10)} style={actBtn(true)}>{"\u25B6"} Top 10</button>
+            <button onClick={() => batchInterpret(20)} style={actBtn(true)}>{"\u25B6"} Top 20</button>
+          </>}
+          {batchInterpreting && <>
+            <button onClick={() => { if(abortRef.current) abortRef.current.abort(); setBatchInterpreting(false); }} style={actBtn(true, "#f87171")}>{"\u25A0"} Stop</button>
+            <span style={{ ...mono9, color: "#818cf8", animation: "pulse 1.2s infinite" }}>{interpretedCount} done</span>
+          </>}
+        </div>
+
+        {results && (
+          <div>
+            <div style={{ display: "flex", gap: 1, marginBottom: 24, borderRadius: 8, overflow: "hidden" }}>
+              {[
+                { l: "CHUNKS A", v: results.chunksA.length, c: "#60a5fa" },
+                { l: "CHUNKS B", v: results.chunksB.length, c: "#f59e42" },
+                { l: "VOCAB", v: results.vocabSize.toLocaleString(), c: "#818cf8" },
+                { l: "AVG SIM", v: (results.stats.avg*100).toFixed(1)+"%", c: "#34d399" },
+                { l: "MAX SIM", v: (results.stats.max*100).toFixed(1)+"%", c: "#f0c040" },
+                { l: "INTERPRETED", v: interpretedCount, c: "#818cf8" },
+              ].map(s => (
+                <div key={s.l} style={{ flex: 1, background: "#0e1018", padding: "14px 12px", textAlign: "center" }}>
+                  <div style={{ ...mono9, color: "#3a4050", letterSpacing: 1, marginBottom: 4 }}>{s.l}</div>
+                  <div style={{ ...mono11, fontSize: 18, color: s.c, fontWeight: 700 }}>{s.v}</div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "1px solid #1e2230", marginBottom: 20 }}>
+              <div style={{ display: "flex" }}>
+                {["heatmap", "matches", "distribution"].map(t => (
+                  <button key={t} onClick={() => setTab(t)} style={{
+                    ...mono11, letterSpacing: 1, textTransform: "uppercase",
+                    background: "none", border: "none",
+                    color: tab === t ? "#f0c040" : "#4a5568",
+                    borderBottom: tab === t ? "2px solid #f0c040" : "2px solid transparent",
+                    padding: "10px 20px", cursor: "pointer", transition: "all 0.15s",
+                  }}>{t}</button>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => exportCSV(results, interpretations)} style={{
+                  ...mono10, fontWeight: 600, background: "#34d39918", border: "1px solid #34d39940",
+                  color: "#34d399", borderRadius: 5, padding: "6px 16px", cursor: "pointer", marginBottom: 4,
+                }}>{"\u2913"} CSV</button>
+                <button onClick={() => exportHTML(results, interpretations)} style={{
+                  ...mono10, fontWeight: 600, background: "#60a5fa18", border: "1px solid #60a5fa40",
+                  color: "#60a5fa", borderRadius: 5, padding: "6px 16px", cursor: "pointer", marginBottom: 4,
+                }}>{"\u2913"} HTML Report</button>
+              </div>
+            </div>
+
+            {tab === "heatmap" && (
+              <div style={{ background: "#0e1018", borderRadius: 10, padding: 20 }}>
+                <div style={{ ...mono10, color: "#4a5568", marginBottom: 12 }}>SIMILARITY MATRIX {"\u00B7"} click any cell for details</div>
+                <Heatmap matrix={results.matrix} chunksA={results.chunksA} chunksB={results.chunksB} onCellClick={setSelectedCell} selectedCell={selectedCell} />
+                {selectedCell && (
+                  <div style={{ marginTop: 16, background: "#141822", borderRadius: 8, padding: 16, border: "1px solid #f0c04020" }}>
+                    <div style={{ ...mono11, color: "#f0c040", marginBottom: 12 }}>
+                      A{selectedCell[0]+1} {"\u27F7"} B{selectedCell[1]+1} {"\u00B7"} {(results.matrix[selectedCell[0]][selectedCell[1]]*100).toFixed(1)}%
+                    </div>
+                    <div style={{ display: "flex", gap: 12 }}>
+                      <div style={{ flex: 1, borderLeft: "3px solid #60a5fa20", padding: "8px 12px" }}>
+                        <div style={{ ...mono9, color: "#60a5fa", marginBottom: 6 }}>DOC A {"\u00B7"} CHUNK {selectedCell[0]+1}</div>
+                        <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 12, color: "#8a8f9c", lineHeight: 1.7 }}>{results.chunksA[selectedCell[0]].slice(0,400)}{"\u2026"}</div>
+                      </div>
+                      <div style={{ flex: 1, borderLeft: "3px solid #f59e4220", padding: "8px 12px" }}>
+                        <div style={{ ...mono9, color: "#f59e42", marginBottom: 6 }}>DOC B {"\u00B7"} CHUNK {selectedCell[1]+1}</div>
+                        <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 12, color: "#8a8f9c", lineHeight: 1.7 }}>{results.chunksB[selectedCell[1]].slice(0,400)}{"\u2026"}</div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {tab === "matches" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ ...mono10, color: "#4a5568", marginBottom: 4 }}>TOP {topMatches.length} MATCHES {"\u00B7"} click to expand</div>
+                {topMatches.map((m, idx) => {
+                  const k = m.i+"-"+m.j;
+                  return (
+                    <MatchCard key={k} rank={idx+1} i={m.i} j={m.j} score={m.score}
+                      chunkA={results.chunksA[m.i]} chunkB={results.chunksB[m.j]}
+                      isExpanded={expandedMatch === idx}
+                      onToggle={() => setExpandedMatch(expandedMatch === idx ? -1 : idx)}
+                      interpretation={interpretations[k]} interpStatus={interpStatus[k]}
+                      onInterpret={() => interpretPair(m.i, m.j, m.score, results.chunksA[m.i], results.chunksB[m.j])}
+                    />
+                  );
+                })}
+              </div>
+            )}
+
+            {tab === "distribution" && (
+              <div style={{ background: "#0e1018", borderRadius: 10, padding: 20 }}>
+                <div style={{ ...mono10, color: "#4a5568", marginBottom: 16 }}>SIMILARITY SCORE DISTRIBUTION</div>
+                <DistributionChart pairs={results.pairs} />
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.render(<App />, document.getElementById("root"));
+</script>
+</body>
+</html>
