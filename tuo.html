@@ -204,7 +204,21 @@ function subChunk(text, mode) {
   }
   var targetTokens = parseInt(mode, 10) || 256;
   if (isCSV(text)) return chunkCSV(text, targetTokens);
-  return chunkText(text, targetTokens, Math.floor(targetTokens * 0.1));
+
+  // For text: try token-based split first
+  var tokenResult = chunkText(text, targetTokens, Math.floor(targetTokens * 0.1));
+  if (tokenResult.length >= 3) return tokenResult;
+
+  // If token split is too coarse, try paragraphs
+  var paraResult = chunkByParagraph(text);
+  if (paraResult.length >= 2) return paraResult;
+
+  // If no paragraph breaks, split by sentences
+  var sentences = splitSentences(text);
+  if (sentences.length >= 2) return sentences;
+
+  // Absolute fallback: return as-is
+  return [text];
 }
 
 // One chunk per CSV row (header prepended to each)
@@ -220,6 +234,13 @@ function chunkByParagraph(text) {
   const paras = text.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
   if (paras.length === 0) return [text];
   return paras;
+}
+
+// Single-line paragraph split for text that uses single newlines as structure
+function chunkByLine(text) {
+  const lines = text.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
+  if (lines.length === 0) return [text];
+  return lines;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2415,6 +2436,8 @@ function App() {
   const [chunkMode, setChunkMode] = useState("512");
   const [macroSize, setMacroSize] = useState(2048);
   const [microSize, setMicroSize] = useState("256");
+  const [resultsStack, setResultsStack] = useState([]); // drill history
+  const [drilling, setDrilling] = useState(false);
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
   const [ollamaModel, setOllamaModel] = useState("gpt-oss:20b");
   const [promptTemplate, setPromptTemplate] = useState(DEFAULT_PROMPT_TEMPLATE);
@@ -2429,6 +2452,7 @@ function App() {
   const analyze = useCallback(() => {
     setProcessing(true); setResults(null); setSelectedCell(null);
     setExpandedMatch(0); setInterpretations({}); setInterpStatus({});
+    setResultsStack([]);
     setTimeout(() => {
       try {
         const cA = chunkDocument(textA, chunkMode, macroSize);
@@ -2443,11 +2467,76 @@ function App() {
         setResults({
           chunksA: cA, chunksB: cB, matrix, pairs, vocabSize: vocab.length,
           stats: { avg: scores.reduce((a,b) => a+b, 0)/scores.length, max: scores[0], highCount: scores.filter(s => s > 0.3).length },
+          drillLabel: chunkMode === "macro" ? "Macro " + macroSize : chunkMode === "row" ? "Row/Para" : chunkMode + " tok",
         });
       } catch (err) { console.error(err); }
       setProcessing(false);
     }, 50);
   }, [textA, textB, chunkMode, macroSize]);
+
+  // ─── Drill All: sub-chunk every chunk at micro level, replace results ───
+  const drillAll = useCallback(() => {
+    if (!results || drilling) return;
+    setDrilling(true);
+    setTimeout(() => {
+      try {
+        // Sub-chunk each existing chunk
+        const subChunksA = [];
+        const chunkMapA = []; // maps sub-index back to parent
+        results.chunksA.forEach((c, pi) => {
+          const subs = subChunk(c, microSize);
+          subs.forEach(s => { chunkMapA.push(pi); subChunksA.push(s); });
+        });
+        const subChunksB = [];
+        const chunkMapB = [];
+        results.chunksB.forEach((c, pi) => {
+          const subs = subChunk(c, microSize);
+          subs.forEach(s => { chunkMapB.push(pi); subChunksB.push(s); });
+        });
+
+        // Recompute similarity matrix on sub-chunks
+        const { matrix: newMat, vocab: newVocab } = computeSimilarityMatrix(subChunksA, subChunksB);
+        const newPairs = [];
+        for (let i = 0; i < newMat.length; i++)
+          for (let j = 0; j < newMat[0].length; j++)
+            newPairs.push({ i, j, score: newMat[i][j] });
+        newPairs.sort((a, b) => b.score - a.score);
+        const scores = newPairs.map(p => p.score);
+
+        // Push current state onto stack
+        setResultsStack(prev => [...prev, { results, interpretations, interpStatus }]);
+
+        // Replace results
+        setResults({
+          chunksA: subChunksA, chunksB: subChunksB,
+          matrix: newMat, pairs: newPairs, vocabSize: newVocab.length,
+          stats: { avg: scores.reduce((a,b) => a+b, 0)/scores.length, max: scores[0], highCount: scores.filter(s => s > 0.3).length },
+          parentMapA: chunkMapA, parentMapB: chunkMapB,
+          drillLabel: microSize === "row" ? "Row/Para" : microSize + " tok",
+        });
+        setSelectedCell(null);
+        setExpandedMatch(0);
+        // Preserve interpretations that can be mapped (clear for fresh level)
+        setInterpretations({});
+        setInterpStatus({});
+      } catch (err) { console.error("Drill error:", err); }
+      setDrilling(false);
+    }, 50);
+  }, [results, microSize, drilling, interpretations, interpStatus]);
+
+  // ─── Drill Up: pop the stack ───
+  const drillUp = useCallback(() => {
+    if (resultsStack.length === 0) return;
+    const prev = resultsStack[resultsStack.length - 1];
+    setResultsStack(s => s.slice(0, -1));
+    setResults(prev.results);
+    setInterpretations(prev.interpretations);
+    setInterpStatus(prev.interpStatus);
+    setSelectedCell(null);
+    setExpandedMatch(0);
+  }, [resultsStack]);
+
+  const drillDepth = resultsStack.length;
 
   const interpretPair = useCallback(async (i, j, score, cA, cB) => {
     const k = i+"-"+j;
@@ -2666,6 +2755,63 @@ function App() {
                   <div style={{ ...mono11, fontSize: 18, color: s.c, fontWeight: 700 }}>{s.v}</div>
                 </div>
               ))}
+            </div>
+
+            {/* Drill level controls */}
+            <div style={{
+              display: "flex", alignItems: "center", gap: 10, marginBottom: 16,
+              background: "#0c0e16", borderRadius: 8, padding: "8px 14px", border: "1px solid #1e2230",
+              flexWrap: "wrap",
+            }}>
+              <span style={{ ...mono9, color: "#34d399", letterSpacing: 1 }}>{"\u{1F50D}"} DRILL</span>
+
+              {/* Depth indicator */}
+              <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                {Array.from({ length: drillDepth + 1 }, (_, i) => (
+                  <div key={i} style={{
+                    width: i === drillDepth ? 10 : 6, height: i === drillDepth ? 10 : 6,
+                    borderRadius: "50%",
+                    background: i === drillDepth ? "#34d399" : "#34d39940",
+                    border: "1px solid #34d39960",
+                    transition: "all 0.2s",
+                  }} />
+                ))}
+                <span style={{ ...mono9, color: "#34d39960", marginLeft: 4 }}>
+                  Level {drillDepth} {"\u00B7"} {results?.drillLabel || ""}
+                </span>
+              </div>
+
+              {/* Drill All button */}
+              <button
+                onClick={drillAll}
+                disabled={!results || drilling}
+                style={{
+                  ...mono10, fontWeight: 600, letterSpacing: 1,
+                  background: results && !drilling ? "#34d39920" : "#141822",
+                  border: "1px solid " + (results && !drilling ? "#34d39950" : "#1e2230"),
+                  color: results && !drilling ? "#34d399" : "#3a4050",
+                  borderRadius: 5, padding: "5px 14px",
+                  cursor: results && !drilling ? "pointer" : "not-allowed",
+                  transition: "all 0.2s",
+                }}
+              >
+                {drilling ? "\u27F3 Drilling..." : "\u25B6 Drill All \u2193"}
+              </button>
+
+              {/* Drill Up button */}
+              {drillDepth > 0 && (
+                <button onClick={drillUp} style={{
+                  ...mono10, fontWeight: 600, letterSpacing: 1,
+                  background: "#f59e4220", border: "1px solid #f59e4250",
+                  color: "#f59e42", borderRadius: 5, padding: "5px 14px", cursor: "pointer",
+                }}>{"\u25B2"} Drill Up</button>
+              )}
+
+              {/* Info */}
+              <span style={{ ...mono9, color: "#2a2f3a", marginLeft: "auto" }}>
+                {results ? results.chunksA.length + " \u00D7 " + results.chunksB.length + " = " + (results.chunksA.length * results.chunksB.length) + " pairs" : ""}
+                {drillDepth > 0 ? " \u00B7 drill up to restore parent view" : " \u00B7 drill to sub-chunk all pairs at micro level"}
+              </span>
             </div>
 
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "1px solid #1e2230", marginBottom: 20 }}>
