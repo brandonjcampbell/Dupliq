@@ -16,6 +16,10 @@
   ::-webkit-scrollbar-track { background: #0a0c12; }
   ::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 3px; }
   textarea::-webkit-scrollbar-thumb { background: #2a2f3a; }
+  div[style*="overflow"]::-webkit-scrollbar { width: 6px; height: 6px; }
+  div[style*="overflow"]::-webkit-scrollbar-track { background: #0e1018; border-radius: 3px; }
+  div[style*="overflow"]::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 3px; }
+  div[style*="overflow"]::-webkit-scrollbar-thumb:hover { background: #3a4050; }
   @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>
@@ -57,27 +61,16 @@ function splitSentences(text) {
 // CSV-AWARE CHUNKING
 // ═══════════════════════════════════════════════════════════════
 
-function isCSV(text) {
-  const lines = text.split("\n").filter(l => l.trim().length > 0);
-  if (lines.length < 3) return false;
-  const delim = lines[0].includes("\t") ? "\t" : ",";
-  const headerCount = lines[0].split(delim).length;
-  if (headerCount < 2) return false;
-  let consistent = 0;
-  for (let i = 1; i < Math.min(lines.length, 8); i++) {
-    if (Math.abs(lines[i].split(delim).length - headerCount) <= 1) consistent++;
-  }
-  return consistent >= Math.min(lines.length - 1, 4);
-}
-
 function parseCSVLines(text) {
+  // Splits text into logical CSV rows, respecting quoted fields
+  // that may contain newlines, commas, and escaped quotes ("")
   const rows = [];
   let current = "";
   let inQuotes = false;
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (ch === '"') {
-      if (inQuotes && i + 1 < text.length && text[i + 1] === '"') { current += '"'; i++; }
+      if (inQuotes && i + 1 < text.length && text[i + 1] === '"') { current += '""'; i++; }
       else { inQuotes = !inQuotes; current += ch; }
     } else if ((ch === "\n" || ch === "\r") && !inQuotes) {
       if (ch === "\r" && i + 1 < text.length && text[i + 1] === "\n") i++;
@@ -89,23 +82,84 @@ function parseCSVLines(text) {
   return rows;
 }
 
+function parseCSVCells(row, delim) {
+  // Splits a single logical CSV row into cells, respecting quotes
+  const cells = [];
+  let current = "", inQ = false;
+  for (let i = 0; i < row.length; i++) {
+    const ch = row[i];
+    if (ch === '"') {
+      if (inQ && i + 1 < row.length && row[i + 1] === '"') { current += '"'; i++; }
+      else inQ = !inQ;
+    } else if (ch === delim && !inQ) {
+      cells.push(current); current = "";
+    } else { current += ch; }
+  }
+  cells.push(current);
+  return cells;
+}
+
+function detectDelimiter(headerRow) {
+  // Count unquoted commas vs tabs to determine delimiter
+  let commas = 0, tabs = 0, inQ = false;
+  for (let i = 0; i < headerRow.length; i++) {
+    const ch = headerRow[i];
+    if (ch === '"') inQ = !inQ;
+    else if (!inQ) {
+      if (ch === ',') commas++;
+      if (ch === '\t') tabs++;
+    }
+  }
+  return tabs > commas ? "\t" : ",";
+}
+
+function isCSV(text) {
+  // Use quote-aware row parser for detection
+  const rows = parseCSVLines(text);
+  if (rows.length < 3) return false;
+  const delim = detectDelimiter(rows[0]);
+  const headerCols = parseCSVCells(rows[0], delim).length;
+  if (headerCols < 2) return false;
+  let consistent = 0;
+  for (let i = 1; i < Math.min(rows.length, 8); i++) {
+    const cols = parseCSVCells(rows[i], delim).length;
+    if (Math.abs(cols - headerCols) <= 1) consistent++;
+  }
+  return consistent >= Math.min(rows.length - 1, 4);
+}
+
 function chunkCSV(text, targetTokens) {
   const rows = parseCSVLines(text);
-  if (rows.length === 0) return [text];
+  if (rows.length < 2) return [text];
+
   const header = rows[0];
   const headerTok = tokenize(header).length;
   const dataRows = rows.slice(1);
   const chunks = [];
-  let cur = [], curLen = headerTok;
+  let curRows = [];
+  let curTok = headerTok; // header always counted toward budget
+
   for (const row of dataRows) {
-    const rTok = tokenize(row).length;
-    if (curLen + rTok > targetTokens && cur.length > 0) {
-      chunks.push(header + "\n" + cur.join("\n"));
-      cur = []; curLen = headerTok;
+    const rowTok = tokenize(row).length;
+
+    // Would adding this row exceed the budget?
+    if (curTok + rowTok > targetTokens && curRows.length > 0) {
+      // Flush current batch: header + accumulated rows = valid CSV
+      chunks.push(header + "\n" + curRows.join("\n"));
+      curRows = [];
+      curTok = headerTok;
     }
-    cur.push(row); curLen += rTok;
+
+    // Append the whole row (never split mid-row)
+    curRows.push(row);
+    curTok += rowTok;
   }
-  if (cur.length > 0) chunks.push(header + "\n" + cur.join("\n"));
+
+  // Flush remaining rows
+  if (curRows.length > 0) {
+    chunks.push(header + "\n" + curRows.join("\n"));
+  }
+
   return chunks.length > 0 ? chunks : [text];
 }
 
@@ -131,8 +185,41 @@ function chunkText(text, targetTokens, overlap) {
   return chunks;
 }
 
-function chunkDocument(text, targetTokens = 512, overlap = 64) {
+function chunkDocument(text, mode = "512", macroSize = 2048) {
+  if (mode === "row" || mode === "paragraph") {
+    return isCSV(text) ? chunkByRow(text) : chunkByParagraph(text);
+  }
+  if (mode === "macro") {
+    const overlap = Math.floor(macroSize * 0.06);
+    return isCSV(text) ? chunkCSV(text, macroSize) : chunkText(text, macroSize, overlap);
+  }
+  const targetTokens = parseInt(mode, 10) || 512;
+  const overlap = Math.floor(targetTokens * 0.12);
   return isCSV(text) ? chunkCSV(text, targetTokens) : chunkText(text, targetTokens, overlap);
+}
+
+function subChunk(text, mode) {
+  if (mode === "row") {
+    return isCSV(text) ? chunkByRow(text) : chunkByParagraph(text);
+  }
+  var targetTokens = parseInt(mode, 10) || 256;
+  if (isCSV(text)) return chunkCSV(text, targetTokens);
+  return chunkText(text, targetTokens, Math.floor(targetTokens * 0.1));
+}
+
+// One chunk per CSV row (header prepended to each)
+function chunkByRow(text) {
+  const rows = parseCSVLines(text);
+  if (rows.length < 2) return [text];
+  const header = rows[0];
+  return rows.slice(1).map(r => header + "\n" + r);
+}
+
+// One chunk per paragraph (split on blank lines / double newlines)
+function chunkByParagraph(text) {
+  const paras = text.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
+  if (paras.length === 0) return [text];
+  return paras;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -180,16 +267,15 @@ function computeSimilarityMatrix(chunksA, chunksB) {
 // OLLAMA INTEGRATION
 // ═══════════════════════════════════════════════════════════════
 
-async function queryOllama(baseUrl, model, chunkA, chunkB, score, signal) {
-  const prompt = "You are a document analyst. Two text segments from different documents have a "
-    + (score * 100).toFixed(1) + "% lexical similarity score.\n\nSEGMENT A:\n\"\"\"\n"
-    + chunkA.slice(0, 1200) + "\n\"\"\"\n\nSEGMENT B:\n\"\"\"\n"
-    + chunkB.slice(0, 1200) + "\n\"\"\"\n\n"
-    + "Provide a concise analysis (3-5 sentences) covering:\n"
-    + "1. What specific topics, concepts, or claims these segments share\n"
-    + "2. How they differ in perspective, scope, or detail\n"
-    + "3. The nature of their relationship (e.g., redundant, complementary, contradictory, one elaborates the other)\n\n"
-    + "Be direct and specific. No preamble.";
+const DEFAULT_PROMPT_TEMPLATE = "You are a document analyst. Two text segments from different documents have a {{SCORE}}% lexical similarity score.\n\nSEGMENT A:\n\"\"\"\n{{CHUNK_A}}\n\"\"\"\n\nSEGMENT B:\n\"\"\"\n{{CHUNK_B}}\n\"\"\"\n\nProvide a concise analysis (3-5 sentences) covering:\n1. What specific topics, concepts, or claims these segments share\n2. How they differ in perspective, scope, or detail\n3. The nature of their relationship (e.g., redundant, complementary, contradictory, one elaborates the other)\n\nBe direct and specific. No preamble.";
+
+async function queryOllama(baseUrl, model, chunkA, chunkB, score, signal, promptTemplate) {
+  const tmpl = promptTemplate || DEFAULT_PROMPT_TEMPLATE;
+  const prompt = tmpl
+    .replace(/\{\{SCORE\}\}/g, (score * 100).toFixed(1))
+    .replace(/\{\{CHUNK_A\}\}/g, chunkA.slice(0, 1200))
+    .replace(/\{\{CHUNK_B\}\}/g, chunkB.slice(0, 1200))
+    .replace(/\{\{SCORE_RAW\}\}/g, score.toFixed(4));
 
   const resp = await fetch(baseUrl + "/api/generate", {
     method: "POST",
@@ -234,145 +320,279 @@ function exportCSV(results, interpretations) {
 
 function exportHTML(results, interpretations) {
   var D = new Date().toISOString().slice(0, 10);
-  var hi = results.pairs.filter(function(p) { return p.score >= 0.5; });
-  var nInterp = hi.filter(function(p) { return !!interpretations[p.i + "-" + p.j]; }).length;
+  var allPairs = results.pairs;
+  var hi = allPairs.filter(function(p) { return p.score >= 0.5; });
+  var nInterp = allPairs.filter(function(p) { return !!interpretations[p.i + "-" + p.j]; }).length;
+  var totalInterp = allPairs.length;
+  var nA = results.chunksA.length, nB = results.chunksB.length;
+  var mat = results.matrix;
 
   function esc(s) { return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
   function barCol(v) { return v >= 0.8 ? "#f0c040" : v >= 0.65 ? "#f59e42" : "#818cf8"; }
 
+  function simColorS(val) {
+    if (val < 0.05) return "rgba(20,24,32,0.95)";
+    var r = Math.round(255 * Math.min(1, val * 2.2));
+    var g = Math.round(180 * Math.min(1, val * 1.1));
+    var b = Math.round(60 + 60 * (1 - val));
+    return "rgba("+r+","+g+","+b+","+(0.3+val*0.7)+")";
+  }
+
   function relTag(interp) {
     if (!interp) return "";
     var lw = interp.toLowerCase(), tg = [];
-    if (lw.indexOf("redundant") >= 0 || lw.indexOf("overlap") >= 0 || lw.indexOf("duplicate") >= 0) tg.push("Redundant|#f8717118|#f87171");
-    if (lw.indexOf("complementary") >= 0 || lw.indexOf("complement") >= 0) tg.push("Complementary|#34d39918|#34d399");
+    if (lw.indexOf("redundant") >= 0 || lw.indexOf("overlap") >= 0) tg.push("Redundant|#f8717118|#f87171");
+    if (lw.indexOf("complementary") >= 0) tg.push("Complementary|#34d39918|#34d399");
     if (lw.indexOf("contradict") >= 0) tg.push("Contradictory|#fb923c18|#fb923c");
     if (lw.indexOf("elaborat") >= 0) tg.push("Elaboration|#60a5fa18|#60a5fa");
     if (tg.length === 0) tg.push("Related|#818cf818|#818cf8");
-    return tg.map(function(t) { var p=t.split("|"); return '<span style="display:inline-block;font-family:JetBrains Mono,monospace;font-size:10px;padding:2px 8px;border-radius:3px;background:'+p[1]+';color:'+p[2]+';margin-right:6px;">'+p[0]+'</span>'; }).join("");
+    return tg.map(function(t) { var p=t.split("|"); return '<span style="display:inline-block;font-family:JetBrains Mono,monospace;font-size:10px;padding:2px 8px;border-radius:3px;background:'+p[1]+';color:'+p[2]+';margin-right:6px;">'+p[0]+'<\/span>'; }).join("");
   }
 
   function statBox(label, val, col) {
-    return '<div style="flex:1;background:#0e1018;padding:16px 12px;text-align:center;">'
-      + '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#3a4050;letter-spacing:1px;margin-bottom:4px;">' + label + '</div>'
-      + '<div style="font-family:JetBrains Mono,monospace;font-size:22px;color:'+col+';font-weight:700;">'+val+'</div></div>';
+    return '<div style="flex:1;background:#0e1018;padding:14px 10px;text-align:center;">'
+      + '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#3a4050;letter-spacing:1px;margin-bottom:4px;">' + label + '<\/div>'
+      + '<div style="font-family:JetBrains Mono,monospace;font-size:18px;color:'+col+';font-weight:700;">'+val+'<\/div><\/div>';
   }
 
-  function renderChunkHTML(text, maxLen) {
-    var display = text.slice(0, maxLen || 800);
-    var trunc = text.length > (maxLen || 800);
-    // Check if it looks like CSV
-    var lines = display.split("\n").filter(function(l) { return l.trim().length > 0; });
-    if (lines.length >= 2) {
-      var dl = lines[0].indexOf("\t") >= 0 ? "\t" : ",";
-      var hCols = lines[0].split(dl).length;
-      if (hCols >= 2) {
+  function renderChunkH(text, maxRows) {
+    var rows = parseCSVLines(text);
+    if (rows.length >= 2) {
+      var dl = detectDelimiter(rows[0]);
+      var hC = parseCSVCells(rows[0], dl);
+      if (hC.length >= 2) {
         var ok = 0;
-        for (var x = 1; x < Math.min(lines.length, 6); x++) {
-          if (Math.abs(lines[x].split(dl).length - hCols) <= 1) ok++;
-        }
-        if (ok >= Math.min(lines.length - 1, 3)) {
-          // Render as table
-          var th = lines[0].split(dl);
-          var tbl = '<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-family:JetBrains Mono,monospace;font-size:11px;line-height:1.5;">';
-          tbl += '<tr>';
-          for (var c = 0; c < th.length; c++) {
-            tbl += '<th style="text-align:left;padding:5px 8px;background:#1a1e2a;color:#60a5fa;border-bottom:2px solid #2a3040;font-size:10px;letter-spacing:0.5px;font-weight:600;white-space:nowrap;">'+esc(th[c].replace(/^"|"$/g,""))+'<\/th>';
-          }
-          tbl += '<\/tr>';
-          for (var r = 1; r < lines.length; r++) {
-            var cells = lines[r].split(dl);
-            tbl += '<tr style="background:'+(r%2===0 ? 'transparent' : 'rgba(255,255,255,0.015)')+';">';
-            for (var c2 = 0; c2 < Math.max(hCols, cells.length); c2++) {
-              tbl += '<td style="padding:4px 8px;color:#9ca3af;border-bottom:1px solid #1e2230;max-width:200px;overflow:hidden;text-overflow:ellipsis;">'+esc((cells[c2]||"").replace(/^"|"$/g,""))+'<\/td>';
-            }
-            tbl += '<\/tr>';
-          }
-          tbl += '<\/table><\/div>';
-          if (trunc) tbl += '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#3a4050;margin-top:4px;text-align:right;">\u2026 truncated<\/div>';
-          return tbl;
+        for (var x = 1; x < Math.min(rows.length, 6); x++) if (Math.abs(parseCSVCells(rows[x], dl).length - hC.length) <= 1) ok++;
+        if (ok >= Math.min(rows.length - 1, 2)) {
+          var limit = Math.min(rows.length - 1, maxRows || 30);
+          var t = '<div style="overflow:auto;max-height:260px;border-radius:4px;border:1px solid #1e2230;"><table style="width:100%;border-collapse:collapse;font-family:JetBrains Mono,monospace;font-size:10px;line-height:1.4;"><thead style="position:sticky;top:0;"><tr>';
+          for (var c = 0; c < hC.length; c++) t += '<th style="text-align:left;padding:4px 6px;background:#1a1e2a;color:#60a5fa;border-bottom:2px solid #2a3040;font-size:9px;white-space:nowrap;">'+esc(hC[c].replace(/^"|"$/g,""))+'<\/th>';
+          t += '<\/tr><\/thead><tbody>';
+          for (var r = 1; r <= limit; r++) { var cells = parseCSVCells(rows[r], dl); t += '<tr style="background:'+(r%2===0?'transparent':'rgba(255,255,255,0.015)')+';">'; for (var c2 = 0; c2 < hC.length; c2++) t += '<td style="padding:3px 6px;color:#9ca3af;border-bottom:1px solid #1e2230;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+esc((cells[c2]||"").replace(/^"|"$/g,""))+'<\/td>'; t += '<\/tr>'; }
+          t += '<\/tbody><\/table><\/div>';
+          return t;
         }
       }
     }
-    // Plain text
-    return '<div style="font-family:IBM Plex Serif,Georgia,serif;font-size:12.5px;color:#9ca3af;line-height:1.7;">' + esc(display) + (trunc ? "\u2026" : "") + '<\/div>';
+    var ds = text.slice(0, 600);
+    return '<div style="font-family:IBM Plex Serif,serif;font-size:12px;color:#9ca3af;line-height:1.7;max-height:260px;overflow:auto;">'+esc(ds)+(text.length > 600 ? "\u2026" : "")+'<\/div>';
   }
 
-  var cards = "";
-  hi.forEach(function(m, idx) {
+  // ─── Build sections ───
+
+  // 1. HEATMAP (static HTML table)
+  var cellPx = Math.max(8, Math.min(24, Math.floor(600 / Math.max(nA, nB))));
+  var heatmap = '<div style="overflow:auto;max-height:500px;margin-bottom:8px;">';
+  heatmap += '<table style="border-collapse:collapse;">';
+  heatmap += '<tr><td><\/td>';
+  for (var j = 0; j < nB; j++) heatmap += '<td style="font-family:JetBrains Mono,monospace;font-size:7px;color:#4a5568;text-align:center;width:'+cellPx+'px;padding:1px;">B'+(j+1)+'<\/td>';
+  heatmap += '<\/tr>';
+  for (var i = 0; i < nA; i++) {
+    heatmap += '<tr><td style="font-family:JetBrains Mono,monospace;font-size:7px;color:#4a5568;text-align:right;padding-right:3px;">A'+(i+1)+'<\/td>';
+    for (var j2 = 0; j2 < nB; j2++) {
+      var v = mat[i][j2];
+      heatmap += '<td style="width:'+cellPx+'px;height:'+cellPx+'px;background:'+simColorS(v)+';border:1px solid #0a0c12;" title="A'+(i+1)+' B'+(j2+1)+': '+(v*100).toFixed(1)+'%"><\/td>';
+    }
+    heatmap += '<\/tr>';
+  }
+  heatmap += '<\/table><\/div>';
+
+  // 2. MATCHES (top 50)
+  var matchCards = "";
+  var top50 = allPairs.slice(0, 50).filter(function(p) { return p.score >= 0.3; });
+  top50.forEach(function(m, idx) {
     var k = m.i+"-"+m.j, interp = interpretations[k] || null;
     var pct = (m.score*100).toFixed(1), bc = barCol(m.score);
-    var chAhtml = renderChunkHTML(results.chunksA[m.i], 800);
-    var chBhtml = renderChunkHTML(results.chunksB[m.j], 800);
-    var bdr = m.score > 0.7 ? "#f0c04030" : "#1e2230";
-
-    cards += '<div style="background:#0e1018;border-radius:10px;border:1px solid '+bdr+';padding:20px;margin-bottom:16px;page-break-inside:avoid;">';
-    cards += '<div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">';
-    cards += '<div style="font-family:JetBrains Mono,monospace;font-size:22px;color:#2a2f3a;font-weight:700;min-width:40px;">#'+(idx+1)+'</div>';
-    cards += '<div style="flex:1;"><div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">';
-    cards += '<span style="font-family:JetBrains Mono,monospace;font-size:11px;color:#60a5fa;background:#60a5fa12;padding:2px 8px;border-radius:4px;">A'+(m.i+1)+'</span>';
-    cards += '<span style="color:#3a4050;font-size:12px;">\u27F7</span>';
-    cards += '<span style="font-family:JetBrains Mono,monospace;font-size:11px;color:#f59e42;background:#f59e4212;padding:2px 8px;border-radius:4px;">B'+(m.j+1)+'</span>';
-    cards += relTag(interp) + '</div>';
-    cards += '<div style="background:#181c24;border-radius:4px;height:6px;overflow:hidden;"><div style="width:'+pct+'%;height:100%;background:'+bc+';border-radius:4px;"></div></div></div>';
-    cards += '<div style="font-family:JetBrains Mono,monospace;font-size:20px;color:'+bc+';font-weight:700;min-width:65px;text-align:right;">'+pct+'%</div></div>';
-    // chunks
-    cards += '<div style="display:flex;gap:12px;margin-bottom:'+(interp?"14":"0")+'px;">';
-    cards += '<div style="flex:1;background:#141822;border-radius:6px;padding:12px;border-left:3px solid #60a5fa30;">';
-    cards += '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#60a5fa;margin-bottom:6px;letter-spacing:1px;">DOC A \u00B7 CHUNK '+(m.i+1)+'</div>';
-    cards += chAhtml + '</div>';
-    cards += '<div style="flex:1;background:#141822;border-radius:6px;padding:12px;border-left:3px solid #f59e4230;">';
-    cards += '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#f59e42;margin-bottom:6px;letter-spacing:1px;">DOC B \u00B7 CHUNK '+(m.j+1)+'</div>';
-    cards += chBhtml + '</div></div>';
-    // interp
+    matchCards += '<div style="background:#0e1018;border-radius:8px;border:1px solid '+(m.score > 0.5 ? '#f0c04020' : '#1e2230')+';padding:14px;margin-bottom:10px;page-break-inside:avoid;">';
+    matchCards += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">';
+    matchCards += '<span style="font-family:JetBrains Mono,monospace;font-size:16px;color:#2a2f3a;font-weight:700;">#'+(idx+1)+'<\/span>';
+    matchCards += '<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:#60a5fa;background:#60a5fa12;padding:2px 6px;border-radius:3px;">A'+(m.i+1)+'<\/span>';
+    matchCards += '<span style="color:#3a4050;font-size:10px;">\u27F7<\/span>';
+    matchCards += '<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:#f59e42;background:#f59e4212;padding:2px 6px;border-radius:3px;">B'+(m.j+1)+'<\/span>';
+    matchCards += relTag(interp);
+    matchCards += '<span style="margin-left:auto;font-family:JetBrains Mono,monospace;font-size:16px;color:'+bc+';font-weight:700;">'+pct+'%<\/span>';
+    matchCards += '<\/div>';
+    matchCards += '<div style="display:flex;gap:8px;margin-bottom:'+(interp ? '10' : '0')+'px;">';
+    matchCards += '<div style="flex:1 1 50%;min-width:0;overflow:hidden;background:#141822;border-radius:6px;padding:10px;border-left:3px solid #60a5fa30;">';
+    matchCards += '<div style="font-family:JetBrains Mono,monospace;font-size:8px;color:#60a5fa;margin-bottom:4px;">A'+(m.i+1)+'<\/div>';
+    matchCards += renderChunkH(results.chunksA[m.i], 15) + '<\/div>';
+    matchCards += '<div style="flex:1 1 50%;min-width:0;overflow:hidden;background:#141822;border-radius:6px;padding:10px;border-left:3px solid #f59e4230;">';
+    matchCards += '<div style="font-family:JetBrains Mono,monospace;font-size:8px;color:#f59e42;margin-bottom:4px;">B'+(m.j+1)+'<\/div>';
+    matchCards += renderChunkH(results.chunksB[m.j], 15) + '<\/div><\/div>';
     if (interp) {
-      cards += '<div style="background:#0c0e16;border-radius:6px;padding:14px;border:1px solid #818cf815;">';
-      cards += '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#818cf8;letter-spacing:1px;margin-bottom:8px;">\u{1F9E0} LLM INTERPRETATION</div>';
-      cards += '<div style="font-family:IBM Plex Serif,serif;font-size:13px;color:#b0b8c8;line-height:1.8;">'+esc(interp)+'</div></div>';
-    } else {
-      cards += '<div style="background:#0c0e16;border-radius:6px;padding:10px 14px;border:1px solid #1e2230;">';
-      cards += '<div style="font-family:JetBrains Mono,monospace;font-size:10px;color:#2a2f3a;">No LLM interpretation available</div></div>';
+      matchCards += '<div style="background:#0c0e16;border-radius:6px;padding:10px;border:1px solid #818cf815;">';
+      matchCards += '<div style="font-family:JetBrains Mono,monospace;font-size:8px;color:#818cf8;margin-bottom:4px;">\u{1F9E0} INTERPRETATION<\/div>';
+      matchCards += '<div style="font-family:IBM Plex Serif,serif;font-size:12px;color:#b0b8c8;line-height:1.7;">'+esc(interp)+'<\/div><\/div>';
     }
-    cards += '</div>';
+    matchCards += '<\/div>';
   });
 
-  var avgH = hi.length > 0 ? (hi.reduce(function(a,p){return a+p.score;},0)/hi.length*100).toFixed(1) : "0.0";
-  var maxS = hi.length > 0 ? (hi[0].score*100).toFixed(1) : "0.0";
+  // 3. DOCUMENT VIEW (side-by-side with margin annotations)
+  var docThresh = 0.5;
+  function docChunk(text, idx, doc, links) {
+    var r = '<div style="display:flex;'+(doc === "A" ? '' : 'flex-direction:row-reverse;')+'border-bottom:1px solid #1e223040;padding:6px 0;">';
+    r += '<div style="flex:1;min-width:0;padding:0 10px;">';
+    r += '<div style="font-family:JetBrains Mono,monospace;font-size:8px;color:'+(doc==="A"?"#60a5fa40":"#f59e4240")+';margin-bottom:2px;">'+doc+(idx+1)+'<\/div>';
+    r += renderChunkH(text, 20) + '<\/div>';
+    r += '<div style="width:48px;flex-shrink:0;display:flex;flex-direction:column;gap:2px;padding-top:12px;'+(doc==="A"?"border-right:1px solid #1e223040;padding-right:4px;align-items:flex-end;":"border-left:1px solid #1e223040;padding-left:4px;align-items:flex-start;")+'">';
+    if (links) {
+      links.slice(0, 5).forEach(function(lk) {
+        var toIdx = doc === "A" ? lk.j : lk.i;
+        var toDoc = doc === "A" ? "B" : "A";
+        var tCol = toDoc === "B" ? "#f59e42" : "#60a5fa";
+        var alph = Math.round(20 + lk.score * 35).toString(16).padStart(2, "0");
+        r += '<span style="font-family:JetBrains Mono,monospace;font-size:7px;background:'+tCol+alph+';border:1px solid '+tCol+'40;color:'+tCol+';border-radius:2px;padding:1px 3px;" title="'+(lk.score*100).toFixed(1)+'%">'+toDoc+(toIdx+1);
+        if (lk.interp) r += '\u{1F9E0}';
+        r += '<\/span>';
+      });
+      if (links.length > 5) r += '<span style="font-family:JetBrains Mono,monospace;font-size:6px;color:#3a4050;">+' + (links.length - 5) + '<\/span>';
+    }
+    r += '<\/div><\/div>';
+    return r;
+  }
+
+  // Build link maps for doc view
+  var docLinksA = {}, docLinksB = {};
+  for (var di = 0; di < nA; di++) {
+    for (var dj = 0; dj < nB; dj++) {
+      if (mat[di][dj] >= docThresh) {
+        var dInterp = interpretations[di+"-"+dj] || null;
+        if (!docLinksA[di]) docLinksA[di] = [];
+        docLinksA[di].push({ j: dj, score: mat[di][dj], interp: dInterp });
+        if (!docLinksB[dj]) docLinksB[dj] = [];
+        docLinksB[dj].push({ i: di, score: mat[di][dj], interp: dInterp });
+      }
+    }
+  }
+
+  var docViewA = "";
+  results.chunksA.forEach(function(c, i) { docViewA += docChunk(c, i, "A", docLinksA[i]); });
+  var docViewB = "";
+  results.chunksB.forEach(function(c, j) { docViewB += docChunk(c, j, "B", docLinksB[j]); });
+
+  // 4. DISTRIBUTION (static bar chart)
+  var buckets = Array(20).fill(0);
+  allPairs.forEach(function(p) { buckets[Math.min(19, Math.floor(p.score * 20))]++; });
+  var bMax = Math.max.apply(null, buckets.concat([1]));
+  var distBars = '<div style="display:flex;align-items:flex-end;gap:2px;height:140px;">';
+  for (var bi = 0; bi < 20; bi++) {
+    var bh = Math.max(2, buckets[bi] / bMax * 120);
+    var inten = bi / 19;
+    distBars += '<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;">';
+    if (buckets[bi] > 0) distBars += '<div style="font-family:JetBrains Mono,monospace;font-size:7px;color:#4a5568;margin-bottom:1px;">'+buckets[bi]+'<\/div>';
+    distBars += '<div style="width:100%;height:'+bh+'px;border-radius:2px 2px 0 0;background:rgba('+(Math.round(240*inten+40))+','+(Math.round(160*inten+60))+','+(Math.round(64+30*(1-inten)))+','+(0.4+inten*0.6)+');"><\/div>';
+    distBars += '<\/div>';
+  }
+  distBars += '<\/div>';
+  distBars += '<div style="display:flex;justify-content:space-between;font-family:JetBrains Mono,monospace;font-size:8px;color:#3a4050;margin-top:4px;"><span>0%<\/span><span>25%<\/span><span>50%<\/span><span>75%<\/span><span>100%<\/span><\/div>';
+
+  // ─── Assemble HTML ───
+  var avgAll = allPairs.length > 0 ? (allPairs.reduce(function(a,p){return a+p.score;},0)/allPairs.length*100).toFixed(1) : "0.0";
+  var maxAll = allPairs.length > 0 ? (allPairs[0].score*100).toFixed(1) : "0.0";
+  var linkedA = Object.keys(docLinksA).length;
+  var linkedB = Object.keys(docLinksB).length;
 
   var h = [];
   h.push('<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" />');
   h.push('<meta name="viewport" content="width=device-width, initial-scale=1.0" />');
   h.push('<title>Tuo Report \u2014 '+D+'<\/title>');
   h.push('<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Serif:wght@400;500&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />');
-  h.push('<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#0a0c12;color:#c8ccd4;font-family:IBM Plex Sans,system-ui,sans-serif;padding:32px 20px}');
-  h.push('@media print{body{background:#fff;color:#1a1a1a;padding:12px}.no-print{display:none!important}}<\/style>');
-  h.push('<\/head><body><div style="max-width:900px;margin:0 auto;">');
-  // header
-  h.push('<div style="margin-bottom:36px;">');
-  h.push('<div style="font-family:JetBrains Mono,monospace;font-size:10px;letter-spacing:3px;color:#f59e42;text-transform:uppercase;margin-bottom:4px;">TUO REPORT</div>');
-  h.push('<h1 style="font-family:IBM Plex Sans,sans-serif;font-size:28px;font-weight:300;color:#e8ecf4;margin:0 0 6px;letter-spacing:-0.5px;">Document Similarity Analysis<\/h1>');
-  h.push('<p style="font-family:JetBrains Mono,monospace;font-size:10px;color:#3a4050;">Generated '+D+' &middot; matches &ge; 50% &middot; '+hi.length+' pairs<\/p><\/div>');
-  // stats
-  h.push('<div style="display:flex;gap:1px;margin-bottom:28px;border-radius:8px;overflow:hidden;">');
-  h.push(statBox("MATCHES &ge;50%", hi.length, "#f0c040"));
-  h.push(statBox("AVG", avgH+"%", "#34d399"));
-  h.push(statBox("MAX", maxS+"%", "#f59e42"));
-  h.push(statBox("INTERPRETED", nInterp+"/"+hi.length, "#818cf8"));
-  h.push(statBox("CHUNKS A", results.chunksA.length, "#60a5fa"));
-  h.push(statBox("CHUNKS B", results.chunksB.length, "#f59e42"));
+  h.push('<style>');
+  h.push('*{box-sizing:border-box;margin:0;padding:0}');
+  h.push('body{background:#0a0c12;color:#c8ccd4;font-family:IBM Plex Sans,system-ui,sans-serif;padding:24px 16px}');
+  h.push('.tuo-tab{display:none}.tuo-tab.active{display:block}');
+  h.push('.tuo-tabbar{display:flex;gap:0;border-bottom:1px solid #1e2230;margin-bottom:20px}');
+  h.push('.tuo-tabbar button{font-family:JetBrains Mono,monospace;font-size:10px;letter-spacing:1px;text-transform:uppercase;background:none;border:none;color:#4a5568;border-bottom:2px solid transparent;padding:8px 16px;cursor:pointer}');
+  h.push('.tuo-tabbar button.active{color:#f0c040;border-bottom-color:#f0c040}');
+  h.push('.sec{font-family:JetBrains Mono,monospace;font-size:9px;color:#4a5568;letter-spacing:1px;margin-bottom:10px}');
+  h.push('@media print{body{background:#fff;color:#1a1a1a;padding:12px}.no-print{display:none!important}.tuo-tab{display:block!important}.tuo-tabbar{display:none!important}}');
+  h.push('<\/style><\/head><body>');
+  h.push('<div style="max-width:960px;margin:0 auto;">');
+
+  // Header
+  h.push('<div style="margin-bottom:28px;">');
+  h.push('<div style="font-family:JetBrains Mono,monospace;font-size:10px;letter-spacing:3px;color:#f59e42;text-transform:uppercase;margin-bottom:4px;">TUO REPORT<\/div>');
+  h.push('<h1 style="font-family:IBM Plex Sans,sans-serif;font-size:26px;font-weight:300;color:#e8ecf4;margin:0 0 6px;letter-spacing:-0.5px;">Document Similarity Analysis<\/h1>');
+  h.push('<p style="font-family:JetBrains Mono,monospace;font-size:10px;color:#3a4050;">Generated '+D+' &middot; '+nA+' \u00D7 '+nB+' chunks &middot; '+nInterp+' interpreted<\/p><\/div>');
+
+  // Stats
+  h.push('<div style="display:flex;gap:1px;margin-bottom:24px;border-radius:8px;overflow:hidden;">');
+  h.push(statBox("CHUNKS A", nA, "#60a5fa"));
+  h.push(statBox("CHUNKS B", nB, "#f59e42"));
+  h.push(statBox("VOCAB", results.vocabSize, "#818cf8"));
+  h.push(statBox("AVG SIM", avgAll+"%", "#34d399"));
+  h.push(statBox("MAX SIM", maxAll+"%", "#f0c040"));
+  h.push(statBox("INTERPRETED", nInterp, "#818cf8"));
   h.push('<\/div>');
-  // print
-  h.push('<div class="no-print" style="margin-bottom:24px;">');
-  h.push('<button onclick="window.print()" style="font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;background:#818cf820;border:1px solid #818cf850;color:#818cf8;border-radius:5px;padding:8px 20px;cursor:pointer;">\u{1F5A8} Print / Save PDF<\/button><\/div>');
-  // cards
-  if (hi.length === 0) {
-    h.push('<div style="background:#0e1018;border-radius:10px;padding:40px;text-align:center;">');
-    h.push('<div style="font-family:JetBrains Mono,monospace;font-size:14px;color:#34d399;margin-bottom:8px;">\u2713 No pairs above 50%<\/div><\/div>');
-  } else {
-    h.push('<div style="font-family:JetBrains Mono,monospace;font-size:10px;color:#4a5568;margin-bottom:14px;letter-spacing:1px;">ALL MATCHES &ge; 50% &middot; ranked by score<\/div>');
-    h.push(cards);
-  }
-  // footer
-  h.push('<div style="margin-top:40px;padding-top:16px;border-top:1px solid #1e2230;">');
+
+  // Print button
+  h.push('<div class="no-print" style="margin-bottom:20px;">');
+  h.push('<button onclick="window.print()" style="font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;letter-spacing:1px;background:#818cf820;border:1px solid #818cf850;color:#818cf8;border-radius:5px;padding:6px 16px;cursor:pointer;">\u{1F5A8} Print / PDF<\/button><\/div>');
+
+  // Tab bar
+  h.push('<div class="tuo-tabbar no-print" id="tuo-tabs">');
+  h.push('<button class="active" onclick="tuoTab(\'heatmap\')">Heatmap<\/button>');
+  h.push('<button onclick="tuoTab(\'matches\')">Matches<\/button>');
+  h.push('<button onclick="tuoTab(\'documents\')">Documents<\/button>');
+  h.push('<button onclick="tuoTab(\'distribution\')">Distribution<\/button>');
+  h.push('<\/div>');
+
+  // Tab: Heatmap
+  h.push('<div class="tuo-tab active" id="tuo-heatmap">');
+  h.push('<div class="sec">SIMILARITY MATRIX &middot; '+nA+' \u00D7 '+nB+'<\/div>');
+  h.push(heatmap);
+  h.push('<\/div>');
+
+  // Tab: Matches
+  h.push('<div class="tuo-tab" id="tuo-matches">');
+  h.push('<div class="sec">TOP MATCHES &ge; 30% &middot; '+top50.length+' pairs<\/div>');
+  h.push(matchCards);
+  h.push('<\/div>');
+
+  // Tab: Documents
+  h.push('<div class="tuo-tab" id="tuo-documents">');
+  h.push('<div class="sec">DOCUMENT VIEW &middot; links &ge; 50% &middot; '+linkedA+'/'+nA+' A linked &middot; '+linkedB+'/'+nB+' B linked<\/div>');
+  h.push('<div style="display:flex;gap:0;border:1px solid #1e2230;border-radius:8px;overflow:hidden;">');
+  // Doc A
+  h.push('<div style="flex:1 1 50%;min-width:0;border-right:2px solid #1e2230;">');
+  h.push('<div style="padding:6px 10px;background:#0c0e16;border-bottom:1px solid #1e2230;display:flex;align-items:center;gap:6px;">');
+  h.push('<div style="width:8px;height:8px;border-radius:50%;background:#60a5fa;"><\/div>');
+  h.push('<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:#60a5fa;font-weight:600;">DOC A<\/span>');
+  h.push('<span style="font-family:JetBrains Mono,monospace;font-size:9px;color:#3a4050;">'+nA+' chunks<\/span><\/div>');
+  h.push('<div style="max-height:500px;overflow:auto;">');
+  h.push(docViewA);
+  h.push('<\/div><\/div>');
+  // Doc B
+  h.push('<div style="flex:1 1 50%;min-width:0;">');
+  h.push('<div style="padding:6px 10px;background:#0c0e16;border-bottom:1px solid #1e2230;display:flex;align-items:center;gap:6px;">');
+  h.push('<div style="width:8px;height:8px;border-radius:50%;background:#f59e42;"><\/div>');
+  h.push('<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:#f59e42;font-weight:600;">DOC B<\/span>');
+  h.push('<span style="font-family:JetBrains Mono,monospace;font-size:9px;color:#3a4050;">'+nB+' chunks<\/span><\/div>');
+  h.push('<div style="max-height:500px;overflow:auto;">');
+  h.push(docViewB);
+  h.push('<\/div><\/div>');
+  h.push('<\/div>');
+  h.push('<\/div>');
+
+  // Tab: Distribution
+  h.push('<div class="tuo-tab" id="tuo-distribution">');
+  h.push('<div class="sec">SIMILARITY SCORE DISTRIBUTION<\/div>');
+  h.push('<div style="background:#0e1018;border-radius:8px;padding:16px;">');
+  h.push(distBars);
+  h.push('<\/div><\/div>');
+
+  // Tab switcher script (vanilla JS, safe string split for tag)
+  h.push('<' + 'script>');
+  h.push('function tuoTab(id){');
+  h.push('document.querySelectorAll(".tuo-tab").forEach(function(el){el.classList.remove("active")});');
+  h.push('document.querySelectorAll(".tuo-tabbar button").forEach(function(el){el.classList.remove("active")});');
+  h.push('document.getElementById("tuo-"+id).classList.add("active");');
+  h.push('event.target.classList.add("active");');
+  h.push('}');
+  h.push('<\/' + 'script>');
+
+  // Footer
+  h.push('<div style="margin-top:40px;padding-top:14px;border-top:1px solid #1e2230;">');
   h.push('<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#2a2f3a;text-align:center;">Tuo &middot; '+D+'<\/div><\/div>');
   h.push('<\/div><\/body><\/html>');
 
@@ -404,91 +624,100 @@ const mono11 = { fontFamily: "'JetBrains Mono', monospace", fontSize: 11 };
 // REACT COMPONENTS
 // ═══════════════════════════════════════════════════════════════
 
-// Parse a single CSV row respecting quoted fields
-function parseCSVRow(row, delim) {
-  const cells = [];
-  let current = "", inQ = false;
-  for (let i = 0; i < row.length; i++) {
-    const ch = row[i];
-    if (ch === '"') {
-      if (inQ && i + 1 < row.length && row[i + 1] === '"') { current += '"'; i++; }
-      else inQ = !inQ;
-    } else if (ch === delim && !inQ) {
-      cells.push(current.trim()); current = "";
-    } else { current += ch; }
-  }
-  cells.push(current.trim());
-  return cells;
-}
-
-// Detect if chunk text is tabular CSV
+// Detect if a chunk is valid CSV (uses shared parseCSVLines/parseCSVCells)
 function isChunkCSV(text) {
-  const lines = text.split("\n").filter(l => l.trim().length > 0);
-  if (lines.length < 2) return false;
-  const delim = lines[0].includes("\t") ? "\t" : ",";
-  const hCount = parseCSVRow(lines[0], delim).length;
+  const rows = parseCSVLines(text);
+  if (rows.length < 2) return false;
+  const delim = detectDelimiter(rows[0]);
+  const hCount = parseCSVCells(rows[0], delim).length;
   if (hCount < 2) return false;
   let ok = 0;
-  for (let i = 1; i < Math.min(lines.length, 6); i++) {
-    if (Math.abs(parseCSVRow(lines[i], delim).length - hCount) <= 1) ok++;
+  for (let i = 1; i < Math.min(rows.length, 6); i++) {
+    if (Math.abs(parseCSVCells(rows[i], delim).length - hCount) <= 1) ok++;
   }
-  return ok >= Math.min(lines.length - 1, 3);
+  return ok >= Math.min(rows.length - 1, 2);
 }
 
-// Renders chunk text: table if CSV, prose otherwise
-function ChunkContent({ text, maxLen = 600, fontSize = 12.5 }) {
-  const display = maxLen ? text.slice(0, maxLen) : text;
-  const truncated = maxLen && text.length > maxLen;
+// Renders chunk text: scrollable table if CSV, prose otherwise
+function ChunkContent({ text, maxLen = 600, fontSize = 12.5, maxHeight = 260 }) {
+  // For CSV, don't slice mid-row — parse first, then limit rows
+  if (isChunkCSV(text)) {
+    const rows = parseCSVLines(text);
+    const delim = detectDelimiter(rows[0]);
+    const headerCells = parseCSVCells(rows[0], delim);
+    const maxCols = headerCells.length;
 
-  if (isChunkCSV(display)) {
-    const lines = display.split("\n").filter(l => l.trim().length > 0);
-    const delim = lines[0].includes("\t") ? "\t" : ",";
-    const header = parseCSVRow(lines[0], delim);
-    const rows = lines.slice(1).map(l => parseCSVRow(l, delim));
-    const maxCols = Math.max(header.length, ...rows.map(r => r.length));
+    // Limit display rows by approximate token budget
+    let displayRows = [];
+    let tokCount = tokenize(rows[0]).length;
+    const tokBudget = maxLen ? Math.floor(maxLen * 0.8) : Infinity;
+    for (let i = 1; i < rows.length; i++) {
+      const rTok = tokenize(rows[i]).length;
+      if (tokCount + rTok > tokBudget && displayRows.length > 0) break;
+      displayRows.push(parseCSVCells(rows[i], delim));
+      tokCount += rTok;
+    }
+    const truncated = displayRows.length < rows.length - 1;
 
     return (
-      <div style={{ overflowX: "auto" }}>
+      <div style={{
+        overflow: "auto", maxHeight, borderRadius: 4,
+        border: "1px solid #1e2230",
+        scrollbarWidth: "thin", scrollbarColor: "#2a2f3a #0e1018",
+      }}>
         <table style={{
           width: "100%", borderCollapse: "collapse",
           fontFamily: "'JetBrains Mono', monospace", fontSize: Math.min(fontSize, 11),
           lineHeight: 1.5,
         }}>
-          <thead>
+          <thead style={{ position: "sticky", top: 0, zIndex: 2 }}>
             <tr>
-              {header.map((h, ci) => (
+              {headerCells.map((h, ci) => (
                 <th key={ci} style={{
                   textAlign: "left", padding: "5px 8px",
                   background: "#1a1e2a", color: "#60a5fa",
                   borderBottom: "2px solid #2a3040",
                   fontSize: 10, letterSpacing: 0.5, fontWeight: 600,
                   whiteSpace: "nowrap",
-                }}>{h}</th>
+                }}>{h.replace(/^"|"$/g, "")}</th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {rows.map((row, ri) => (
+            {displayRows.map((row, ri) => (
               <tr key={ri} style={{ background: ri % 2 === 0 ? "transparent" : "#ffffff04" }}>
                 {Array.from({ length: maxCols }, (_, ci) => (
                   <td key={ci} style={{
                     padding: "4px 8px", color: "#9ca3af",
                     borderBottom: "1px solid #1e2230",
-                    maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis",
+                    maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
                   }}>{(row[ci] || "").replace(/^"|"$/g, "")}</td>
                 ))}
               </tr>
             ))}
           </tbody>
         </table>
-        {truncated && <div style={{ ...mono9, color: "#3a4050", marginTop: 4, textAlign: "right" }}>{"\u2026"} truncated</div>}
+        {truncated && <div style={{
+          ...mono9, color: "#3a4050", padding: "4px 8px",
+          background: "#0e1018", borderTop: "1px solid #1e2230",
+          position: "sticky", bottom: 0, textAlign: "right",
+        }}>
+          {displayRows.length} of {rows.length - 1} rows shown {"\u2026"}
+        </div>}
       </div>
     );
   }
 
   // Plain text
+  const display = maxLen ? text.slice(0, maxLen) : text;
+  const truncated = maxLen && text.length > maxLen;
   return (
-    <div style={{ fontFamily: "'IBM Plex Serif', Georgia, serif", fontSize, color: "#9ca3af", lineHeight: 1.7 }}>
+    <div style={{
+      fontFamily: "'IBM Plex Serif', Georgia, serif", fontSize, color: "#9ca3af",
+      lineHeight: 1.7, maxHeight, overflow: "auto",
+      scrollbarWidth: "thin", scrollbarColor: "#2a2f3a #0e1018",
+    }}>
       {display}{truncated ? "\u2026" : ""}
     </div>
   );
@@ -560,37 +789,257 @@ function FileUpload({ label, color, onTextLoad, text }) {
   );
 }
 
-function Heatmap({ matrix, chunksA, chunksB, onCellClick, selectedCell }) {
-  if (!matrix.length) return null;
-  const cellSize = Math.max(16, Math.min(48, Math.floor(600 / Math.max(matrix.length, matrix[0].length))));
+// ─── Fullscreen Panel wrapper ────────────────────────────────
+
+function FullscreenPanel({ children, label }) {
+  const [fs, setFs] = useState(false);
+  const panelRef = useRef(null);
+
+  useEffect(() => {
+    if (!fs) return;
+    const handleKey = e => { if (e.key === "Escape") setFs(false); };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [fs]);
+
+  if (!fs) {
+    return (
+      <div style={{ position: "relative" }}>
+        <button onClick={() => setFs(true)} title="Fullscreen" style={{
+          position: "absolute", top: 8, right: 8, zIndex: 5,
+          ...mono9, background: "#141822", border: "1px solid #2a2f3a",
+          color: "#4a5568", borderRadius: 4, padding: "4px 8px",
+          cursor: "pointer", letterSpacing: 0.5,
+        }}>{"\u26F6"} fullscreen</button>
+        {children}
+      </div>
+    );
+  }
+
   return (
-    <div style={{ overflowX: "auto", padding: "8px 0" }}>
-      <div style={{ display: "inline-block" }}>
-        <div style={{ display: "flex", marginLeft: cellSize + 20 }}>
-          {chunksB.map((_, j) => (
-            <div key={j} style={{ width: cellSize, textAlign: "center", ...mono9, color: "#4a5568", transform: "rotate(-45deg)", transformOrigin: "center", height: 30 }}>B{j+1}</div>
-          ))}
+    <div ref={panelRef} style={{
+      position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+      background: "#0a0c12", zIndex: 9999, display: "flex", flexDirection: "column",
+      overflow: "hidden",
+    }}>
+      <div style={{
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        padding: "8px 16px", background: "#0e1018", borderBottom: "1px solid #1e2230",
+        flexShrink: 0,
+      }}>
+        <span style={{ ...mono10, color: "#4a5568", letterSpacing: 1 }}>{label || "FULLSCREEN"}</span>
+        <button onClick={() => setFs(false)} style={{
+          ...mono10, background: "#f8717118", border: "1px solid #f8717140",
+          color: "#f87171", borderRadius: 4, padding: "4px 12px",
+          cursor: "pointer",
+        }}>ESC {"\u2715"} close</button>
+      </div>
+      <div style={{ flex: 1, overflow: "auto", padding: 16 }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ─── Scalable Heatmap (canvas + D3 zoom) ────────────────────
+
+function Heatmap({ matrix, chunksA, chunksB, onCellClick, selectedCell }) {
+  const canvasRef = useRef(null);
+  const containerRef = useRef(null);
+  const transformRef = useRef(d3.zoomIdentity);
+  const [hoverInfo, setHoverInfo] = useState(null);
+  const [cellSize, setCellSize] = useState(20);
+
+  const rows = matrix.length;
+  const cols = matrix[0]?.length || 0;
+  if (!rows || !cols) return null;
+
+  // Label gutter
+  const gutterLeft = 32;
+  const gutterTop = 32;
+
+  // Auto cell size based on container
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const w = containerRef.current.clientWidth - gutterLeft - 20;
+    const h = 500;
+    const auto = Math.max(6, Math.min(40, Math.floor(Math.min(w / cols, h / rows))));
+    setCellSize(auto);
+  }, [rows, cols]);
+
+  const totalW = gutterLeft + cols * cellSize + 20;
+  const totalH = gutterTop + rows * cellSize + 20;
+
+  // Draw
+  const draw = useCallback((transform) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    const cw = canvas.clientWidth;
+    const ch = canvas.clientHeight;
+    canvas.width = cw * dpr;
+    canvas.height = ch * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+
+    ctx.save();
+    ctx.translate(transform.x, transform.y);
+    ctx.scale(transform.k, transform.k);
+
+    // Cells
+    for (let i = 0; i < rows; i++) {
+      for (let j = 0; j < cols; j++) {
+        const v = matrix[i][j];
+        const x = gutterLeft + j * cellSize;
+        const y = gutterTop + i * cellSize;
+        ctx.fillStyle = simColor(v);
+        ctx.fillRect(x, y, cellSize - 1, cellSize - 1);
+
+        // Selected highlight
+        if (selectedCell && selectedCell[0] === i && selectedCell[1] === j) {
+          ctx.strokeStyle = "#f0c040";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(x, y, cellSize - 1, cellSize - 1);
+        }
+
+        // Value text if cells are big enough
+        if (cellSize * transform.k >= 22) {
+          ctx.fillStyle = simTextColor(v);
+          ctx.font = "9px JetBrains Mono, monospace";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText((v * 100).toFixed(0), x + cellSize / 2, y + cellSize / 2);
+        }
+      }
+    }
+
+    // Row labels (A)
+    ctx.fillStyle = "#4a5568";
+    ctx.font = "9px JetBrains Mono, monospace";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    const labelStep = cellSize * transform.k < 12 ? Math.ceil(12 / (cellSize * transform.k)) : 1;
+    for (let i = 0; i < rows; i += labelStep) {
+      ctx.fillText("A" + (i + 1), gutterLeft - 4, gutterTop + i * cellSize + cellSize / 2);
+    }
+
+    // Col labels (B)
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom";
+    for (let j = 0; j < cols; j += labelStep) {
+      ctx.save();
+      ctx.translate(gutterLeft + j * cellSize + cellSize / 2, gutterTop - 4);
+      ctx.rotate(-Math.PI / 4);
+      ctx.fillText("B" + (j + 1), 0, 0);
+      ctx.restore();
+    }
+
+    ctx.restore();
+  }, [matrix, rows, cols, cellSize, selectedCell, gutterLeft, gutterTop]);
+
+  // Setup D3 zoom
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    const canvas = d3.select(canvasRef.current);
+    const zoomBehavior = d3.zoom()
+      .scaleExtent([0.2, 8])
+      .on("zoom", (e) => {
+        transformRef.current = e.transform;
+        draw(e.transform);
+        setHoverInfo(null);
+      });
+    canvas.call(zoomBehavior);
+
+    // Fit to view
+    const cw = canvasRef.current.clientWidth;
+    const ch = canvasRef.current.clientHeight;
+    const scale = Math.min(cw / totalW, ch / totalH, 2) * 0.9;
+    const initTransform = d3.zoomIdentity
+      .translate((cw - totalW * scale) / 2, (ch - totalH * scale) / 2)
+      .scale(scale);
+    canvas.call(zoomBehavior.transform, initTransform);
+
+    return () => { canvas.on(".zoom", null); };
+  }, [draw, totalW, totalH]);
+
+  // Click handler
+  const handleClick = useCallback((e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const t = transformRef.current;
+    const mx = (e.clientX - rect.left - t.x) / t.k;
+    const my = (e.clientY - rect.top - t.y) / t.k;
+    const j = Math.floor((mx - gutterLeft) / cellSize);
+    const i = Math.floor((my - gutterTop) / cellSize);
+    if (i >= 0 && i < rows && j >= 0 && j < cols) {
+      onCellClick([i, j]);
+    }
+  }, [rows, cols, cellSize, onCellClick, gutterLeft, gutterTop]);
+
+  // Hover handler
+  const handleMove = useCallback((e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const t = transformRef.current;
+    const mx = (e.clientX - rect.left - t.x) / t.k;
+    const my = (e.clientY - rect.top - t.y) / t.k;
+    const j = Math.floor((mx - gutterLeft) / cellSize);
+    const i = Math.floor((my - gutterTop) / cellSize);
+    if (i >= 0 && i < rows && j >= 0 && j < cols) {
+      setHoverInfo({
+        x: e.clientX - rect.left + 12,
+        y: e.clientY - rect.top - 8,
+        i, j, score: matrix[i][j],
+      });
+    } else {
+      setHoverInfo(null);
+    }
+  }, [rows, cols, cellSize, matrix, gutterLeft, gutterTop]);
+
+  // Color legend gradient
+  const legendStops = Array.from({ length: 20 }, (_, i) => {
+    const v = i / 19;
+    return simColor(v);
+  });
+
+  return (
+    <div>
+      {/* Compact legend */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+        <span style={{ ...mono9, color: "#3a4050" }}>{rows}{"\u00D7"}{cols} {"\u00B7"} scroll to zoom {"\u00B7"} drag to pan</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 4, marginLeft: "auto" }}>
+          <span style={{ ...mono9, color: "#3a4050" }}>0%</span>
+          <div style={{
+            width: 120, height: 10, borderRadius: 3,
+            background: "linear-gradient(to right, " + legendStops.join(", ") + ")",
+            border: "1px solid #1e2230",
+          }} />
+          <span style={{ ...mono9, color: "#3a4050" }}>100%</span>
         </div>
-        {matrix.map((row, i) => (
-          <div key={i} style={{ display: "flex", alignItems: "center" }}>
-            <div style={{ width: 20, ...mono9, color: "#4a5568", textAlign: "right", marginRight: 4 }}>A{i+1}</div>
-            {row.map((val, j) => {
-              const sel = selectedCell && selectedCell[0] === i && selectedCell[1] === j;
-              return (
-                <div key={j} onClick={() => onCellClick([i, j])}
-                  title={"A"+(i+1)+" \u2194 B"+(j+1)+": "+(val*100).toFixed(1)+"%"}
-                  style={{
-                    width: cellSize, height: cellSize, background: simColor(val),
-                    border: sel ? "2px solid #f0c040" : "1px solid #181c24",
-                    borderRadius: 2, cursor: "pointer",
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    fontSize: cellSize > 28 ? 9 : 0, ...mono9,
-                    color: simTextColor(val), transition: "all 0.15s", boxSizing: "border-box",
-                  }}>{cellSize > 28 ? (val*100).toFixed(0) : ""}</div>
-              );
-            })}
+      </div>
+
+      {/* Canvas */}
+      <div ref={containerRef} style={{ position: "relative" }}>
+        <canvas
+          ref={canvasRef}
+          onClick={handleClick}
+          onMouseMove={handleMove}
+          onMouseLeave={() => setHoverInfo(null)}
+          style={{
+            width: "100%", height: 480, display: "block",
+            background: "#0a0c12", borderRadius: 6,
+            border: "1px solid #1e2230", cursor: "crosshair",
+          }}
+        />
+        {hoverInfo && (
+          <div style={{
+            position: "absolute", left: hoverInfo.x, top: hoverInfo.y,
+            background: "#141822ee", border: "1px solid #2a2f3a", borderRadius: 4,
+            padding: "4px 8px", pointerEvents: "none", zIndex: 5,
+            ...mono10, color: "#c8ccd4", whiteSpace: "nowrap",
+          }}>
+            A{hoverInfo.i + 1} {"\u2194"} B{hoverInfo.j + 1}: <span style={{ color: "#f0c040", fontWeight: 700 }}>{(hoverInfo.score * 100).toFixed(1)}%</span>
           </div>
-        ))}
+        )}
       </div>
     </div>
   );
@@ -603,7 +1052,7 @@ function InterpretBadge({ status }) {
   return null;
 }
 
-function MatchCard({ rank, i, j, score, chunkA, chunkB, isExpanded, onToggle, interpretation, interpStatus, onInterpret }) {
+function MatchCard({ rank, i, j, score, chunkA, chunkB, isExpanded, onToggle, interpretation, interpStatus, onInterpret, microSize }) {
   const barW = Math.max(4, score * 100);
   return (
     <div onClick={onToggle} style={{
@@ -633,11 +1082,11 @@ function MatchCard({ rank, i, j, score, chunkA, chunkB, isExpanded, onToggle, in
       {isExpanded && (
         <div style={{ marginTop: 16 }}>
           <div style={{ display: "flex", gap: 12 }}>
-            <div style={{ flex: 1, background: "#141822", borderRadius: 6, padding: 12, borderLeft: "3px solid #60a5fa30" }}>
+            <div style={{ flex: "1 1 50%", minWidth: 0, background: "#141822", borderRadius: 6, padding: 12, borderLeft: "3px solid #60a5fa30", overflow: "hidden" }}>
               <div style={{ ...mono9, color: "#60a5fa", marginBottom: 6, letterSpacing: 1 }}>DOC A {"\u00B7"} CHUNK {i+1}</div>
               <ChunkContent text={chunkA} maxLen={600} />
             </div>
-            <div style={{ flex: 1, background: "#141822", borderRadius: 6, padding: 12, borderLeft: "3px solid #f59e4230" }}>
+            <div style={{ flex: "1 1 50%", minWidth: 0, background: "#141822", borderRadius: 6, padding: 12, borderLeft: "3px solid #f59e4230", overflow: "hidden" }}>
               <div style={{ ...mono9, color: "#f59e42", marginBottom: 6, letterSpacing: 1 }}>DOC B {"\u00B7"} CHUNK {j+1}</div>
               <ChunkContent text={chunkB} maxLen={600} />
             </div>
@@ -662,8 +1111,580 @@ function MatchCard({ rank, i, j, score, chunkA, chunkB, isExpanded, onToggle, in
             {interpretation && interpStatus !== "loading" && <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 13, color: "#b0b8c8", lineHeight: 1.8 }}>{interpretation}</div>}
             {!interpretation && interpStatus !== "loading" && interpStatus !== "error" && <div style={{ ...mono10, color: "#2a2f3a" }}>Click "interpret" to analyze via Ollama</div>}
           </div>
+          {/* Drill-down: always available */}
+          <DrillDown chunkA={chunkA} chunkB={chunkB} macroLabelA={"A"+(i+1)} macroLabelB={"B"+(j+1)} microSize={microSize || "256"} />
         </div>
       )}
+    </div>
+  );
+}
+
+function DrillDown({ chunkA, chunkB, macroLabelA, macroLabelB, microSize }) {
+  const [subData, setSubData] = useState(null);
+  const [computing, setComputing] = useState(false);
+  const [expandedSub, setExpandedSub] = useState(0);
+
+  const compute = useCallback(() => {
+    setComputing(true);
+    setTimeout(() => {
+      const sA = subChunk(chunkA, microSize);
+      const sB = subChunk(chunkB, microSize);
+      const { matrix, vocab } = computeSimilarityMatrix(sA, sB);
+      const pairs = [];
+      for (let i = 0; i < matrix.length; i++)
+        for (let j = 0; j < matrix[0].length; j++)
+          pairs.push({ i, j, score: matrix[i][j] });
+      pairs.sort((a, b) => b.score - a.score);
+      setSubData({ subA: sA, subB: sB, matrix, pairs, vocabSize: vocab.length });
+      setComputing(false);
+    }, 30);
+  }, [chunkA, chunkB, microSize]);
+
+  if (!subData && !computing) {
+    return (
+      <div style={{
+        marginTop: 10, background: "#0c0e16", borderRadius: 6,
+        padding: 12, border: "1px solid #34d39920", textAlign: "center",
+      }}>
+        <button onClick={e => { e.stopPropagation(); compute(); }} style={{
+          ...mono10, fontWeight: 600, letterSpacing: 1,
+          background: "#34d39920", border: "1px solid #34d39940",
+          color: "#34d399", borderRadius: 5, padding: "8px 20px",
+          cursor: "pointer",
+        }}>{"\u{1F50D}"} Drill Down {"\u2014"} {microSize === "row" ? "row / paragraph" : microSize + " tokens"}</button>
+        <div style={{ ...mono9, color: "#2a2f3a", marginTop: 6 }}>
+          Sub-chunks this pair for fine-grained comparison
+        </div>
+      </div>
+    );
+  }
+
+  if (computing) {
+    return (
+      <div style={{
+        marginTop: 10, background: "#0c0e16", borderRadius: 6,
+        padding: 16, border: "1px solid #34d39920",
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+      }}>
+        <div style={{ width: 14, height: 14, border: "2px solid #34d39940", borderTopColor: "#34d399", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+        <span style={{ ...mono10, color: "#34d399" }}>Sub-chunking and computing similarity...</span>
+      </div>
+    );
+  }
+
+  const topSubs = subData.pairs.slice(0, 10);
+  const avgSub = topSubs.length > 0 ? topSubs.reduce((a, p) => a + p.score, 0) / topSubs.length : 0;
+
+  // Mini heatmap
+  const mRows = subData.matrix.length;
+  const mCols = subData.matrix[0]?.length || 0;
+  const mCell = Math.max(10, Math.min(28, Math.floor(400 / Math.max(mRows, mCols))));
+
+  return (
+    <div style={{
+      marginTop: 10, background: "#0c0e16", borderRadius: 6,
+      border: "1px solid #34d39920", overflow: "hidden",
+    }} onClick={e => e.stopPropagation()}>
+      {/* Header */}
+      <div style={{
+        padding: "10px 14px", background: "#0e1018", borderBottom: "1px solid #1e2230",
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ ...mono10, color: "#34d399", fontWeight: 600 }}>{"\u{1F50D}"} DRILL-DOWN</span>
+          <span style={{ ...mono9, color: "#3a4050" }}>
+            {subData.subA.length} {"\u00D7"} {subData.subB.length} sub-chunks
+            {" \u00B7 "} vocab {subData.vocabSize}
+            {" \u00B7 "} avg top-10: {(avgSub*100).toFixed(1)}%
+          </span>
+        </div>
+        <button onClick={() => setSubData(null)} style={{
+          ...mono9, background: "#1e223040", border: "1px solid #2a2f3a",
+          color: "#4a5568", borderRadius: 3, padding: "2px 8px", cursor: "pointer",
+        }}>{"\u2715"} close</button>
+      </div>
+
+      {/* Mini heatmap */}
+      <div style={{ padding: "10px 14px", overflowX: "auto" }}>
+        <div style={{ ...mono9, color: "#3a4050", marginBottom: 6 }}>
+          SUB-CHUNK SIMILARITY {" \u00B7 "} {macroLabelA} subs (rows) vs {macroLabelB} subs (cols)
+        </div>
+        <div style={{ display: "inline-block" }}>
+          {subData.matrix.map((row, ri) => (
+            <div key={ri} style={{ display: "flex" }}>
+              {row.map((val, ci) => (
+                <div key={ci} title={"a"+(ri+1)+" \u2194 b"+(ci+1)+": "+(val*100).toFixed(1)+"%"} style={{
+                  width: mCell, height: mCell, background: simColor(val),
+                  border: "1px solid #0c0e16", borderRadius: 1,
+                }} />
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Top sub-matches */}
+      <div style={{ padding: "10px 14px", borderTop: "1px solid #1e2230" }}>
+        <div style={{ ...mono9, color: "#3a4050", marginBottom: 8 }}>TOP SUB-MATCHES</div>
+        {topSubs.map((s, idx) => {
+          const isOpen = expandedSub === idx;
+          return (
+            <div key={idx} style={{ marginBottom: 6 }}>
+              <div
+                onClick={() => setExpandedSub(isOpen ? -1 : idx)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 8,
+                  padding: "6px 8px", background: "#0e1018", borderRadius: 4,
+                  cursor: "pointer", border: "1px solid " + (s.score > 0.4 ? "#34d39920" : "#1e2230"),
+                }}
+              >
+                <span style={{ ...mono9, color: "#4a5568" }}>#{idx+1}</span>
+                <span style={{ ...mono10, color: "#60a5fa", background: "#60a5fa12", padding: "1px 6px", borderRadius: 3 }}>a{s.i+1}</span>
+                <span style={{ color: "#2a2f3a", fontSize: 10 }}>{"\u27F7"}</span>
+                <span style={{ ...mono10, color: "#f59e42", background: "#f59e4212", padding: "1px 6px", borderRadius: 3 }}>b{s.j+1}</span>
+                <div style={{ flex: 1, background: "#181c24", borderRadius: 3, height: 4, overflow: "hidden" }}>
+                  <div style={{ width: (s.score*100)+"%", height: "100%", background: "#34d399", borderRadius: 3 }} />
+                </div>
+                <span style={{ ...mono10, color: "#34d399", fontWeight: 700, minWidth: 42, textAlign: "right" }}>
+                  {(s.score*100).toFixed(1)}%
+                </span>
+              </div>
+              {isOpen && (
+                <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                  <div style={{ flex: "1 1 50%", minWidth: 0, background: "#141822", borderRadius: 4, padding: 8, borderLeft: "2px solid #60a5fa20", overflow: "hidden" }}>
+                    <div style={{ ...mono9, color: "#60a5fa", marginBottom: 4 }}>a{s.i+1}</div>
+                    <ChunkContent text={subData.subA[s.i]} maxLen={400} fontSize={11} maxHeight={180} />
+                  </div>
+                  <div style={{ flex: "1 1 50%", minWidth: 0, background: "#141822", borderRadius: 4, padding: 8, borderLeft: "2px solid #f59e4220", overflow: "hidden" }}>
+                    <div style={{ ...mono9, color: "#f59e42", marginBottom: 4 }}>b{s.j+1}</div>
+                    <ChunkContent text={subData.subB[s.j]} maxLen={400} fontSize={11} maxHeight={180} />
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LAZY CHUNK LIST — stable component (must be outside DocumentView)
+// ═══════════════════════════════════════════════════════════════
+
+function LazyChunkList({ chunks, doc, linksMap, renderFn, onLoadMore }) {
+  const BATCH = 15;
+  const [loaded, setLoaded] = useState(BATCH);
+  const sentinelRef = useRef(null);
+  const loadedRef = useRef(loaded);
+  loadedRef.current = loaded;
+
+  // Reset only when chunk count actually changes
+  const prevCountRef = useRef(chunks.length);
+  useEffect(() => {
+    if (chunks.length !== prevCountRef.current) {
+      prevCountRef.current = chunks.length;
+      setLoaded(BATCH);
+    }
+  }, [chunks.length]);
+
+  // IntersectionObserver on sentinel
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el) return;
+    const obs = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting && loadedRef.current < chunks.length) {
+        setLoaded(prev => Math.min(prev + BATCH, chunks.length));
+      }
+    }, { rootMargin: "300px" });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [chunks.length, loaded]);
+
+  // Expose forceLoad for scrollTo
+  const forceLoadTo = useCallback((idx) => {
+    setLoaded(prev => Math.max(prev, idx + 5));
+  }, []);
+
+  useEffect(() => {
+    if (onLoadMore) onLoadMore(forceLoadTo);
+  }, [forceLoadTo, onLoadMore]);
+
+  const visible = chunks.slice(0, loaded);
+  const remaining = chunks.length - loaded;
+
+  return (
+    <>
+      {visible.map((c, i) => renderFn(c, i, doc, linksMap[i]))}
+      {remaining > 0 && (
+        <div ref={sentinelRef} style={{ padding: "16px 12px", textAlign: "center" }}>
+          <div style={{
+            ...mono9, color: "#2a2f3a", animation: "pulse 1.5s infinite",
+          }}>{remaining} more chunk{remaining !== 1 ? "s" : ""} {"\u2193"}</div>
+        </div>
+      )}
+      {remaining <= 0 && (
+        <div style={{ padding: "12px", textAlign: "center" }}>
+          <div style={{ ...mono9, color: "#1e2230" }}>{"\u2500".repeat(20)}</div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DOCUMENT VIEW — side-by-side annotated documents
+// ═══════════════════════════════════════════════════════════════
+
+function DocumentView({ chunksA, chunksB, matrix, interpretations, simThreshold: initThresh }) {
+  const leftRef = useRef(null);
+  const rightRef = useRef(null);
+  const wrapperRef = useRef(null);
+  const svgRef = useRef(null);
+  const forceLoadARef = useRef(null);
+  const forceLoadBRef = useRef(null);
+  const [activeLink, setActiveLink] = useState(null);
+  const tooltipRef = useRef(null);
+  const [docThreshold, setDocThreshold] = useState(initThresh || 0.5);
+
+  // Build link maps: for each chunk, which chunks in the other doc are linked?
+  const { linksFromA, linksFromB } = useMemo(() => {
+    const fA = {}; // fA[i] = [{ j, score, interp }, ...]
+    const fB = {}; // fB[j] = [{ i, score, interp }, ...]
+    for (let i = 0; i < matrix.length; i++) {
+      for (let j = 0; j < (matrix[0]?.length || 0); j++) {
+        if (matrix[i][j] >= docThreshold) {
+          const interp = interpretations[i + "-" + j] || null;
+          if (!fA[i]) fA[i] = [];
+          fA[i].push({ j, score: matrix[i][j], interp });
+          if (!fB[j]) fB[j] = [];
+          fB[j].push({ i, score: matrix[i][j], interp });
+        }
+      }
+    }
+    // Sort by score desc
+    Object.values(fA).forEach(arr => arr.sort((a, b) => b.score - a.score));
+    Object.values(fB).forEach(arr => arr.sort((a, b) => b.score - a.score));
+    return { linksFromA: fA, linksFromB: fB };
+  }, [matrix, interpretations, docThreshold]);
+
+  const scrollTo = useCallback((panel, idx) => {
+    // Force lazy-load the target chunk if not yet rendered
+    const forceRef = panel === "A" ? forceLoadARef : forceLoadBRef;
+    if (forceRef.current) forceRef.current(idx);
+
+    // Wait for DOM to update after force-load, then scroll
+    const attempt = (tries) => {
+      const container = panel === "A" ? leftRef.current : rightRef.current;
+      if (!container) return;
+      const el = container.querySelector("[data-chunk-idx='" + idx + "']");
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.style.transition = "background 0.3s";
+        el.style.background = panel === "A" ? "#60a5fa12" : "#f59e4212";
+        setTimeout(() => { el.style.background = "transparent"; }, 1500);
+        // Redraw lines after scroll settles
+        setTimeout(drawLines, 400);
+      } else if (tries > 0) {
+        setTimeout(() => attempt(tries - 1), 50);
+      }
+    };
+    // Give React a frame to re-render after force-load
+    requestAnimationFrame(() => attempt(10));
+  }, [drawLines]);
+
+  const handleLinkClick = useCallback((fromDoc, fromIdx, toIdx) => {
+    const key = fromDoc === "A" ? ("A" + fromIdx + "-B" + toIdx) : ("B" + fromIdx + "-A" + toIdx);
+    setActiveLink(key);
+    const targetPanel = fromDoc === "A" ? "B" : "A";
+    scrollTo(targetPanel, toIdx);
+  }, [scrollTo]);
+
+  const handleHover = useCallback((e, link, fromDoc, fromIdx) => {
+    const tip = tooltipRef.current;
+    if (!tip) return;
+    if (!link) { tip.style.display = "none"; return; }
+    const wRect = wrapperRef.current?.getBoundingClientRect();
+    if (!wRect) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    tip.style.display = "block";
+    tip.style.left = (rect.right - wRect.left + 8) + "px";
+    tip.style.top = (rect.top - wRect.top) + "px";
+    const fromLabel = fromDoc + (fromIdx + 1);
+    const toLabel = (fromDoc === "A" ? "B" : "A") + ((fromDoc === "A" ? link.j : link.i) + 1);
+    const fromColor = fromDoc === "A" ? "#60a5fa" : "#f59e42";
+    const toColor = fromDoc === "A" ? "#f59e42" : "#60a5fa";
+    tip.innerHTML = '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">'
+      + '<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:' + fromColor + '">' + fromLabel + '</span>'
+      + '<span style="color:#3a4050;font-size:10px">\u27F7</span>'
+      + '<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:' + toColor + '">' + toLabel + '</span>'
+      + '<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:#f0c040;font-weight:700">' + (link.score * 100).toFixed(1) + '%</span>'
+      + '</div>'
+      + (link.interp
+        ? '<div style="font-family:IBM Plex Serif,serif;font-size:11.5px;color:#b0b8c8;line-height:1.7">' + link.interp.replace(/</g, "&lt;") + '</div>'
+        : '<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#3a4050">No LLM interpretation yet</div>');
+  }, []);
+
+  const hideTooltip = useCallback(() => {
+    if (tooltipRef.current) tooltipRef.current.style.display = "none";
+  }, []);
+
+  function linkBadgeColor(score, targetDoc) {
+    // Color of the target document, intensity scaled by score
+    const base = targetDoc === "B" ? "#f59e42" : "#60a5fa";
+    const alpha = Math.round(15 + score * 40).toString(16).padStart(2, "0");
+    const borderAlpha = Math.round(30 + score * 60).toString(16).padStart(2, "0");
+    return { bg: base + alpha, border: base + borderAlpha, text: base };
+  }
+
+  function renderChunkWithLinks(text, idx, doc, links) {
+    return (
+      <div key={idx} data-chunk-idx={idx} style={{
+        display: "flex", gap: 0,
+        flexDirection: doc === "A" ? "row" : "row-reverse",
+        marginBottom: 2, borderBottom: "1px solid #1e223040",
+        paddingBottom: 8, paddingTop: 8,
+      }}>
+        {/* Main content */}
+        <div style={{ flex: 1, minWidth: 0, padding: "0 12px" }}>
+          <div style={{
+            ...mono9, color: doc === "A" ? "#60a5fa50" : "#f59e4250",
+            marginBottom: 4, letterSpacing: 1,
+          }}>{doc}{idx + 1}</div>
+          <ChunkContent text={text} maxLen={null} fontSize={12} maxHeight={null} />
+        </div>
+        {/* Margin links */}
+        <div style={{
+          width: 52, flexShrink: 0, display: "flex", flexDirection: "column",
+          alignItems: doc === "A" ? "flex-end" : "flex-start",
+          gap: 3, paddingTop: 16,
+          borderLeft: doc === "B" ? "1px solid #1e223040" : "none",
+          borderRight: doc === "A" ? "1px solid #1e223040" : "none",
+          paddingLeft: doc === "B" ? 6 : 0,
+          paddingRight: doc === "A" ? 6 : 0,
+        }}>
+          {(links || []).slice(0, 5).map((link, li) => {
+            const toIdx = doc === "A" ? link.j : link.i;
+            const toLabel = (doc === "A" ? "B" : "A") + (toIdx + 1);
+            const toDoc = doc === "A" ? "B" : "A";
+            const c = linkBadgeColor(link.score, toDoc);
+            const isActive = activeLink === (doc + idx + "-" + toLabel);
+            return (
+              <div
+                key={li}
+                data-link-from={doc + idx}
+                data-link-to={toDoc + toIdx}
+                data-link-score={link.score}
+                onClick={(e) => { e.stopPropagation(); handleLinkClick(doc, idx, toIdx); }}
+                onMouseEnter={(e) => handleHover(e, link, doc, idx)}
+                onMouseLeave={hideTooltip}
+                style={{
+                  ...mono9, fontSize: 8,
+                  background: isActive ? c.text + "30" : c.bg,
+                  border: "1px solid " + (isActive ? c.text : c.border),
+                  color: c.text, borderRadius: 3,
+                  padding: "1px 4px", cursor: "pointer",
+                  whiteSpace: "nowrap",
+                  transition: "all 0.15s",
+                }}
+                title={(link.score * 100).toFixed(1) + "% " + toLabel}
+              >
+                {toLabel}
+                {link.interp && <span style={{ marginLeft: 2, opacity: 0.6 }}>{"\u{1F9E0}"}</span>}
+              </div>
+            );
+          })}
+          {(links || []).length > 5 && (
+            <div style={{ ...mono9, fontSize: 7, color: "#3a4050" }}>+{links.length - 5}</div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Draw connecting lines between matching badges ───
+  const drawLines = useCallback(() => {
+    const svg = svgRef.current;
+    const wrapper = wrapperRef.current;
+    if (!svg || !wrapper) return;
+    const wRect = wrapper.getBoundingClientRect();
+
+    // Find all badge elements with data-link-from on left (A) side
+    const leftBadges = leftRef.current ? leftRef.current.querySelectorAll("[data-link-from^='A']") : [];
+    // Find all badge elements with data-link-from on right (B) side
+    const rightBadges = rightRef.current ? rightRef.current.querySelectorAll("[data-link-from^='B']") : [];
+
+    // Build position map: key "A3" or "B5" -> { x, y } center of badge
+    const leftPos = {};  // keyed by "A{i}" -> badge center
+    const rightPos = {}; // keyed by "B{j}" -> badge center
+
+    leftBadges.forEach(el => {
+      const r = el.getBoundingClientRect();
+      const fromKey = el.getAttribute("data-link-from");
+      const toKey = el.getAttribute("data-link-to");
+      // This badge sits in A's right margin, pointing to B
+      // Store position keyed by the pair
+      const pairKey = fromKey + "-" + toKey;
+      leftPos[pairKey] = {
+        x: r.right - wRect.left,
+        y: r.top + r.height / 2 - wRect.top,
+        score: parseFloat(el.getAttribute("data-link-score") || "0"),
+      };
+    });
+
+    rightBadges.forEach(el => {
+      const r = el.getBoundingClientRect();
+      const fromKey = el.getAttribute("data-link-from");
+      const toKey = el.getAttribute("data-link-to");
+      // This badge sits in B's left margin, pointing to A
+      // The matching pair key from A's perspective: toKey + "-" + fromKey
+      const pairKey = toKey + "-" + fromKey;
+      rightPos[pairKey] = {
+        x: r.left - wRect.left,
+        y: r.top + r.height / 2 - wRect.top,
+      };
+    });
+
+    // Draw curves for pairs that have badges visible on both sides
+    let paths = "";
+    Object.keys(leftPos).forEach(pairKey => {
+      if (!rightPos[pairKey]) return;
+      const lp = leftPos[pairKey];
+      const rp = rightPos[pairKey];
+      const score = lp.score;
+      // Color: blend between the two doc colors based on position
+      const alpha = Math.round(25 + score * 50).toString(16).padStart(2, "0");
+      const strokeW = 1 + score * 2;
+      const isAct = activeLink && pairKey.replace("-", "") === activeLink.replace("-", "");
+      const col = isAct ? "#f0c040" : "#f59e42" + alpha;
+      const sw = isAct ? 2.5 : strokeW;
+      // Bezier curve
+      const dx = (rp.x - lp.x) * 0.4;
+      paths += '<path d="M' + lp.x + ' ' + lp.y + ' C' + (lp.x + dx) + ' ' + lp.y + ' ' + (rp.x - dx) + ' ' + rp.y + ' ' + rp.x + ' ' + rp.y + '" fill="none" stroke="' + col + '" stroke-width="' + sw + '" />';
+    });
+
+    svg.innerHTML = paths;
+  }, [activeLink]);
+
+  // Redraw lines on scroll, resize, threshold change, and lazy-load DOM mutations
+  useEffect(() => {
+    const redraw = () => { requestAnimationFrame(drawLines); };
+    // Debounced version for MutationObserver — avoids thrash from tooltip DOM changes
+    let mutTimer = null;
+    const debouncedRedraw = () => {
+      if (mutTimer) clearTimeout(mutTimer);
+      mutTimer = setTimeout(redraw, 80);
+    };
+    const lp = leftRef.current;
+    const rp = rightRef.current;
+    if (lp) lp.addEventListener("scroll", redraw, { passive: true });
+    if (rp) rp.addEventListener("scroll", redraw, { passive: true });
+    window.addEventListener("resize", redraw);
+
+    // Only watch childList on the scroll containers, not subtree (avoids tooltip noise)
+    const mutObs = new MutationObserver(debouncedRedraw);
+    if (lp) mutObs.observe(lp, { childList: true });
+    if (rp) mutObs.observe(rp, { childList: true });
+
+    const t = setTimeout(redraw, 100);
+    return () => {
+      if (lp) lp.removeEventListener("scroll", redraw);
+      if (rp) rp.removeEventListener("scroll", redraw);
+      window.removeEventListener("resize", redraw);
+      mutObs.disconnect();
+      clearTimeout(t);
+      if (mutTimer) clearTimeout(mutTimer);
+    };
+  }, [drawLines, linksFromA, linksFromB]);
+
+  // Redraw when activeLink changes
+  useEffect(() => { drawLines(); }, [activeLink, drawLines]);
+
+  const totalLinksA = Object.values(linksFromA).reduce((s, arr) => s + arr.length, 0);
+  const totalLinksB = Object.values(linksFromB).reduce((s, arr) => s + arr.length, 0);
+  const linkedChunksA = Object.keys(linksFromA).length;
+  const linkedChunksB = Object.keys(linksFromB).length;
+
+  return (
+    <div style={{ background: "#0e1018", borderRadius: 10 }}>
+      {/* Header */}
+      <div style={{
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        padding: "12px 16px", borderBottom: "1px solid #1e2230",
+      }}>
+        <div style={{ ...mono10, color: "#4a5568" }}>
+          DOCUMENT VIEW {"\u00B7"} {linkedChunksA}/{chunksA.length} A chunks linked {"\u00B7"} {linkedChunksB}/{chunksB.length} B chunks linked {"\u00B7"} click margin badges to jump
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <label style={{ ...mono9, color: "#3a4050" }}>THRESHOLD</label>
+          <input type="range" min="30" max="90" step="5" value={docThreshold * 100}
+            onChange={e => setDocThreshold(Number(e.target.value) / 100)}
+            style={{ width: 70, accentColor: "#f0c040" }}
+          />
+          <span style={{ ...mono9, color: "#f0c040", minWidth: 28 }}>{(docThreshold * 100).toFixed(0)}%</span>
+        </div>
+      </div>
+
+      {/* Two-panel layout with connecting lines */}
+      <div ref={wrapperRef} style={{ display: "flex", height: 600, position: "relative" }}>
+        {/* SVG overlay for connecting lines */}
+        <svg ref={svgRef} style={{
+          position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
+          pointerEvents: "none", zIndex: 10,
+        }} />
+
+        {/* Doc A */}
+        <div style={{ flex: "1 1 50%", minWidth: 0, display: "flex", flexDirection: "column", borderRight: "2px solid #1e2230" }}>
+          <div style={{
+            padding: "8px 12px", background: "#0c0e16", borderBottom: "1px solid #1e2230",
+            display: "flex", alignItems: "center", gap: 8, flexShrink: 0,
+          }}>
+            <div style={{ width: 10, height: 10, borderRadius: "50%", background: "#60a5fa" }} />
+            <span style={{ ...mono10, color: "#60a5fa", fontWeight: 600 }}>DOCUMENT A</span>
+            <span style={{ ...mono9, color: "#3a4050" }}>{chunksA.length} chunks</span>
+          </div>
+          <div ref={leftRef} style={{
+            flex: 1, overflow: "auto", position: "relative",
+            scrollbarWidth: "thin", scrollbarColor: "#2a2f3a #0a0c12",
+          }}>
+            <LazyChunkList
+              chunks={chunksA} doc="A" linksMap={linksFromA}
+              renderFn={renderChunkWithLinks}
+              onLoadMore={fn => { forceLoadARef.current = fn; }}
+            />
+          </div>
+        </div>
+
+        {/* Doc B */}
+        <div style={{ flex: "1 1 50%", minWidth: 0, display: "flex", flexDirection: "column" }}>
+          <div style={{
+            padding: "8px 12px", background: "#0c0e16", borderBottom: "1px solid #1e2230",
+            display: "flex", alignItems: "center", gap: 8, flexShrink: 0,
+          }}>
+            <div style={{ width: 10, height: 10, borderRadius: "50%", background: "#f59e42" }} />
+            <span style={{ ...mono10, color: "#f59e42", fontWeight: 600 }}>DOCUMENT B</span>
+            <span style={{ ...mono9, color: "#3a4050" }}>{chunksB.length} chunks</span>
+          </div>
+          <div ref={rightRef} style={{
+            flex: 1, overflow: "auto", position: "relative",
+            scrollbarWidth: "thin", scrollbarColor: "#2a2f3a #0a0c12",
+          }}>
+            <LazyChunkList
+              chunks={chunksB} doc="B" linksMap={linksFromB}
+              renderFn={renderChunkWithLinks}
+              onLoadMore={fn => { forceLoadBRef.current = fn; }}
+            />
+          </div>
+        </div>
+
+        {/* Tooltip — ref-based, no React re-renders */}
+        <div ref={tooltipRef} style={{
+          display: "none", position: "absolute",
+          background: "#141822f0", border: "1px solid #2a2f3a", borderRadius: 6,
+          padding: "8px 12px", maxWidth: 300, zIndex: 30, pointerEvents: "none",
+        }} />
+      </div>
     </div>
   );
 }
@@ -704,37 +1725,66 @@ function DistributionChart({ pairs }) {
 // Nodes = chunks, sequential THEN edges, similarity >50% edges
 // ═══════════════════════════════════════════════════════════════
 
-function GraphView({ chunksA, chunksB, matrix, interpretations }) {
+function GraphView({ chunksA, chunksB, matrix, interpretations, microSize }) {
   const svgRef = useRef(null);
   const containerRef = useRef(null);
   const simRef = useRef(null);
-  const [tooltip, setTooltip] = useState(null);
   const [selectedNode, setSelectedNode] = useState(null);
+  const graphTooltipRef = useRef(null);
   const [simThreshold, setSimThreshold] = useState(0.5);
+  const [layout, setLayout] = useState("sequence");
+
+  // Node viewport controls — which chunk ranges are loaded
+  const [rangeA, setRangeA] = useState([0, Math.min(chunksA.length, 30)]);
+  const [rangeB, setRangeB] = useState([0, Math.min(chunksB.length, 30)]);
+
+  // Reset ranges when chunks change
+  useEffect(() => {
+    setRangeA([0, Math.min(chunksA.length, 30)]);
+    setRangeB([0, Math.min(chunksB.length, 30)]);
+  }, [chunksA.length, chunksB.length]);
+
+  const LAYOUTS = {
+    sequence:    { label: "Sequence",    desc: "THEN chains + similarity cross-links" },
+    bipartite:   { label: "Bipartite",   desc: "Two columns, similarity only" },
+    force:       { label: "Force",       desc: "Pure force-directed, no constraints" },
+    radial:      { label: "Radial",      desc: "Docs on opposing arcs" },
+    similarity:  { label: "Similarity",  desc: "Pull similar chunks together" },
+    grid:        { label: "Grid",        desc: "A = rows, B = columns, links at intersections" },
+    concentric:  { label: "Concentric",  desc: "Most-linked nodes at center" },
+    hierarchical:{ label: "Hierarchical",desc: "Top-down flow per document" },
+  };
+
+  // Visible chunk subsets
+  const visA = chunksA.slice(rangeA[0], rangeA[1]);
+  const visB = chunksB.slice(rangeB[0], rangeB[1]);
+  const offA = rangeA[0]; // offset for mapping back to original indices
+  const offB = rangeB[0];
 
   const graphData = useMemo(() => {
     const nodes = [];
-    // Doc A nodes
-    chunksA.forEach((c, i) => {
-      nodes.push({ id: "A"+(i+1), doc: "A", idx: i, label: "A"+(i+1), text: c.slice(0, 300) });
+    visA.forEach((c, i) => {
+      const origIdx = offA + i;
+      nodes.push({ id: "A"+(origIdx+1), doc: "A", idx: i, origIdx, label: "A"+(origIdx+1), text: c.slice(0, 300) });
     });
-    // Doc B nodes
-    chunksB.forEach((c, j) => {
-      nodes.push({ id: "B"+(j+1), doc: "B", idx: j, label: "B"+(j+1), text: c.slice(0, 300) });
+    visB.forEach((c, j) => {
+      const origIdx = offB + j;
+      nodes.push({ id: "B"+(origIdx+1), doc: "B", idx: j, origIdx, label: "B"+(origIdx+1), text: c.slice(0, 300) });
     });
+    const nodeIds = new Set(nodes.map(n => n.id));
 
     const links = [];
-    // Sequential THEN edges within each doc
-    for (let i = 0; i < chunksA.length - 1; i++) {
-      links.push({ source: "A"+(i+1), target: "A"+(i+2), type: "THEN", score: null });
+    // Sequential THEN edges within visible range
+    for (let i = 0; i < visA.length - 1; i++) {
+      links.push({ source: "A"+(offA+i+1), target: "A"+(offA+i+2), type: "THEN", score: null });
     }
-    for (let j = 0; j < chunksB.length - 1; j++) {
-      links.push({ source: "B"+(j+1), target: "B"+(j+2), type: "THEN", score: null });
+    for (let j = 0; j < visB.length - 1; j++) {
+      links.push({ source: "B"+(offB+j+1), target: "B"+(offB+j+2), type: "THEN", score: null });
     }
-    // Similarity edges above threshold
-    for (let i = 0; i < matrix.length; i++) {
-      for (let j = 0; j < matrix[0].length; j++) {
-        if (matrix[i][j] >= simThreshold) {
+    // Similarity edges — only between visible nodes
+    for (let i = rangeA[0]; i < rangeA[1]; i++) {
+      for (let j = rangeB[0]; j < rangeB[1]; j++) {
+        if (matrix[i] && matrix[i][j] >= simThreshold) {
           links.push({
             source: "A"+(i+1), target: "B"+(j+1), type: "SIMILAR",
             score: matrix[i][j],
@@ -744,7 +1794,7 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
       }
     }
     return { nodes, links };
-  }, [chunksA, chunksB, matrix, interpretations, simThreshold]);
+  }, [visA, visB, offA, offB, matrix, interpretations, simThreshold, rangeA, rangeB]);
 
   useEffect(() => {
     if (!svgRef.current || !containerRef.current) return;
@@ -756,7 +1806,6 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
     svg.selectAll("*").remove();
     svg.attr("width", W).attr("height", H);
 
-    // Defs for arrowheads
     const defs = svg.append("defs");
     ["then-arrow", "sim-arrow"].forEach((id, idx) => {
       defs.append("marker")
@@ -768,53 +1817,241 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
         .attr("fill", idx === 0 ? "#4a5568" : "#f0c04080");
     });
 
-    // Main group that receives zoom transform
     const g = svg.append("g");
 
-    // Zoom behavior — infinite canvas
     const zoomBehavior = d3.zoom()
       .scaleExtent([0.1, 6])
-      .on("zoom", (e) => {
-        g.attr("transform", e.transform);
-        setTooltip(null); // hide tooltip during pan
-      });
+      .on("zoom", (e) => { g.attr("transform", e.transform); if (graphTooltipRef.current) graphTooltipRef.current.style.display = "none"; });
     svg.call(zoomBehavior);
-
-    // Click on background to deselect
     svg.on("click.deselect", () => setSelectedNode(null));
 
-    // Deep copy nodes/links for D3 mutation
     const nodes = graphData.nodes.map(n => ({ ...n }));
-    const links = graphData.links.map(l => ({ ...l }));
+    const totalA = visA.length, totalB = visB.length;
+    const maxChain = Math.max(totalA, totalB);
+    const N = nodes.length;
 
-    // Initial positions: A chain left, B chain right, spread vertically
-    const totalA = chunksA.length, totalB = chunksB.length;
+    // ═══ LAYOUT: filter links and set initial positions + forces ═══
+
+    // Determine which links to include
+    let links;
+    const showThen = ["sequence", "hierarchical"].includes(layout);
+    if (showThen) {
+      links = graphData.links.map(l => ({ ...l }));
+    } else {
+      links = graphData.links.filter(l => l.type === "SIMILAR").map(l => ({ ...l }));
+    }
+
+    // Count similarity links per node for concentric layout
+    const simCount = {};
+    graphData.links.filter(l => l.type === "SIMILAR").forEach(l => {
+      const s = typeof l.source === "string" ? l.source : l.source.id;
+      const t = typeof l.target === "string" ? l.target : l.target.id;
+      simCount[s] = (simCount[s] || 0) + 1;
+      simCount[t] = (simCount[t] || 0) + 1;
+    });
+    const maxSimCount = Math.max(...Object.values(simCount), 1);
+
+    // Initial positions per layout
+    const cx = W / 2, cy = H / 2;
     nodes.forEach(n => {
-      if (n.doc === "A") {
-        n.x = W * 0.25 + (Math.random() - 0.5) * 40;
-        n.y = (n.idx + 1) / (totalA + 1) * H * 1.5;
-      } else {
-        n.x = W * 0.75 + (Math.random() - 0.5) * 40;
-        n.y = (n.idx + 1) / (totalB + 1) * H * 1.5;
+      const total = n.doc === "A" ? totalA : totalB;
+      const frac = (n.idx + 0.5) / total;
+
+      switch (layout) {
+        case "sequence":
+        case "hierarchical": {
+          const vExtent = Math.max(H, maxChain * 55);
+          const vTop = (H - vExtent) / 2;
+          n.x = (n.doc === "A" ? W * 0.25 : W * 0.75) + (Math.random() - 0.5) * 30;
+          n.y = vTop + frac * vExtent;
+          break;
+        }
+        case "bipartite": {
+          n.x = n.doc === "A" ? W * 0.2 : W * 0.8;
+          n.y = frac * H * 0.9 + H * 0.05;
+          break;
+        }
+        case "force": {
+          n.x = cx + (Math.random() - 0.5) * W * 0.6;
+          n.y = cy + (Math.random() - 0.5) * H * 0.6;
+          break;
+        }
+        case "radial": {
+          const angleRange = Math.PI * 0.7;
+          const r = Math.min(W, H) * 0.38;
+          if (n.doc === "A") {
+            const a = Math.PI + (Math.PI - angleRange) / 2 + frac * angleRange;
+            n.x = cx + Math.cos(a) * r;
+            n.y = cy + Math.sin(a) * r;
+          } else {
+            const a = (Math.PI - angleRange) / 2 + (1 - frac) * angleRange;
+            n.x = cx + Math.cos(a) * r;
+            n.y = cy + Math.sin(a) * r;
+          }
+          break;
+        }
+        case "similarity": {
+          n.x = cx + (Math.random() - 0.5) * W * 0.4;
+          n.y = cy + (Math.random() - 0.5) * H * 0.4;
+          break;
+        }
+        case "grid": {
+          const gapX = Math.min(50, (W - 80) / Math.max(totalB, 1));
+          const gapY = Math.min(50, (H - 80) / Math.max(totalA, 1));
+          if (n.doc === "A") {
+            n.x = 40;
+            n.y = 40 + n.idx * gapY;
+          } else {
+            n.x = 40 + (n.idx + 1) * gapX;
+            n.y = 40;
+          }
+          break;
+        }
+        case "concentric": {
+          const sc = simCount[n.id] || 0;
+          const ring = 1 - sc / maxSimCount; // 0 = center, 1 = outer
+          const r2 = ring * Math.min(W, H) * 0.4 + 20;
+          const angle = (n.doc === "A" ? n.idx : totalA + n.idx) / N * Math.PI * 2;
+          n.x = cx + Math.cos(angle) * r2;
+          n.y = cy + Math.sin(angle) * r2;
+          break;
+        }
       }
     });
 
-    // Force simulation — THEN links pull MUCH harder than similarity
-    const simulation = d3.forceSimulation(nodes)
-      .force("link", d3.forceLink(links).id(d => d.id)
-        .distance(d => d.type === "THEN" ? 45 : 220)
-        .strength(d => d.type === "THEN" ? 2.0 : 0.08)
-      )
-      .force("charge", d3.forceManyBody().strength(-180).distanceMax(400))
-      .force("collision", d3.forceCollide(22))
-      .force("x", d3.forceX(d => d.doc === "A" ? W * 0.3 : W * 0.7).strength(0.04))
-      .force("y", d3.forceY(H / 2).strength(0.005))
-      .alphaDecay(0.015)
-      .velocityDecay(0.4);
+    // Force configurations per layout
+    const simulation = d3.forceSimulation(nodes);
 
+    switch (layout) {
+      case "sequence": {
+        const vExtent = Math.max(H, maxChain * 55);
+        const vTop = (H - vExtent) / 2;
+        simulation
+          .force("link", d3.forceLink(links).id(d => d.id)
+            .distance(d => d.type === "THEN" ? 50 : 250)
+            .strength(d => d.type === "THEN" ? 2.0 : 0.06))
+          .force("charge", d3.forceManyBody().strength(-140).distanceMax(500))
+          .force("collision", d3.forceCollide(24))
+          .force("x", d3.forceX(d => d.doc === "A" ? W * 0.3 : W * 0.7).strength(0.04))
+          .force("y", d3.forceY(d => {
+            const total = d.doc === "A" ? totalA : totalB;
+            return vTop + (d.idx + 0.5) / total * vExtent;
+          }).strength(d => {
+            const total = d.doc === "A" ? totalA : totalB;
+            return (d.idx === 0 || d.idx === total - 1) ? 0.15 : 0.02;
+          }));
+        break;
+      }
+      case "bipartite": {
+        simulation
+          .force("link", d3.forceLink(links).id(d => d.id).distance(200).strength(0.12))
+          .force("charge", d3.forceManyBody().strength(-60))
+          .force("collision", d3.forceCollide(20))
+          .force("x", d3.forceX(d => d.doc === "A" ? W * 0.2 : W * 0.8).strength(0.6))
+          .force("y", d3.forceY(d => {
+            const total = d.doc === "A" ? totalA : totalB;
+            return (d.idx + 0.5) / total * H * 0.9 + H * 0.05;
+          }).strength(0.08));
+        break;
+      }
+      case "force": {
+        simulation
+          .force("link", d3.forceLink(links).id(d => d.id).distance(100).strength(0.3))
+          .force("charge", d3.forceManyBody().strength(-250))
+          .force("collision", d3.forceCollide(26))
+          .force("center", d3.forceCenter(cx, cy).strength(0.03));
+        break;
+      }
+      case "radial": {
+        const r = Math.min(W, H) * 0.38;
+        const angleRange = Math.PI * 0.7;
+        simulation
+          .force("link", d3.forceLink(links).id(d => d.id).distance(180).strength(0.08))
+          .force("charge", d3.forceManyBody().strength(-120))
+          .force("collision", d3.forceCollide(22))
+          .force("radial", d3.forceRadial(r, cx, cy).strength(0.15))
+          .force("x", d3.forceX(d => {
+            const total = d.doc === "A" ? totalA : totalB;
+            const frac = (d.idx + 0.5) / total;
+            if (d.doc === "A") {
+              const a = Math.PI + (Math.PI - angleRange) / 2 + frac * angleRange;
+              return cx + Math.cos(a) * r;
+            } else {
+              const a = (Math.PI - angleRange) / 2 + (1 - frac) * angleRange;
+              return cx + Math.cos(a) * r;
+            }
+          }).strength(0.06))
+          .force("y", d3.forceY(d => {
+            const total = d.doc === "A" ? totalA : totalB;
+            const frac = (d.idx + 0.5) / total;
+            if (d.doc === "A") {
+              const a = Math.PI + (Math.PI - angleRange) / 2 + frac * angleRange;
+              return cy + Math.sin(a) * r;
+            } else {
+              const a = (Math.PI - angleRange) / 2 + (1 - frac) * angleRange;
+              return cy + Math.sin(a) * r;
+            }
+          }).strength(0.06));
+        break;
+      }
+      case "similarity": {
+        simulation
+          .force("link", d3.forceLink(links).id(d => d.id)
+            .distance(d => 40 + (1 - (d.score || 0)) * 200)
+            .strength(d => 0.1 + (d.score || 0) * 0.8))
+          .force("charge", d3.forceManyBody().strength(-200))
+          .force("collision", d3.forceCollide(26))
+          .force("center", d3.forceCenter(cx, cy).strength(0.02));
+        break;
+      }
+      case "grid": {
+        const gapX = Math.min(50, (W - 80) / Math.max(totalB, 1));
+        const gapY = Math.min(50, (H - 80) / Math.max(totalA, 1));
+        simulation
+          .force("link", d3.forceLink(links).id(d => d.id).distance(60).strength(0.05))
+          .force("collision", d3.forceCollide(16))
+          .force("x", d3.forceX(d => {
+            if (d.doc === "A") return 40;
+            return 40 + (d.idx + 1) * gapX;
+          }).strength(0.8))
+          .force("y", d3.forceY(d => {
+            if (d.doc === "B") return 40;
+            return 40 + (d.idx) * gapY;
+          }).strength(0.8));
+        break;
+      }
+      case "concentric": {
+        simulation
+          .force("link", d3.forceLink(links).id(d => d.id).distance(120).strength(0.1))
+          .force("charge", d3.forceManyBody().strength(-80))
+          .force("collision", d3.forceCollide(22))
+          .force("radial", d3.forceRadial(d => {
+            const sc = simCount[d.id] || 0;
+            return (1 - sc / maxSimCount) * Math.min(W, H) * 0.4 + 20;
+          }, cx, cy).strength(0.3));
+        break;
+      }
+      case "hierarchical": {
+        simulation
+          .force("link", d3.forceLink(links).id(d => d.id)
+            .distance(d => d.type === "THEN" ? 40 : 180)
+            .strength(d => d.type === "THEN" ? 1.5 : 0.05))
+          .force("charge", d3.forceManyBody().strength(-100))
+          .force("collision", d3.forceCollide(22))
+          .force("x", d3.forceX(d => d.doc === "A" ? W * 0.3 : W * 0.7).strength(0.15))
+          .force("y", d3.forceY(d => {
+            const total = d.doc === "A" ? totalA : totalB;
+            return (d.idx + 0.5) / total * H * 0.9 + H * 0.05;
+          }).strength(0.3));
+        break;
+      }
+    }
+
+    simulation.alphaDecay(0.012).alphaMin(0.001).velocityDecay(0.4);
     simRef.current = simulation;
 
-    // Links group (behind nodes)
+    // ═══ Rendering (shared across all layouts) ═══
+
     const linkLines = g.append("g").selectAll("line").data(links).enter().append("line")
       .attr("stroke", d => d.type === "THEN" ? "#4a5568" : simEdgeColor(d.score))
       .attr("stroke-width", d => d.type === "THEN" ? 2 : Math.max(1.5, (d.score || 0) * 5))
@@ -823,7 +2060,6 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
       .style("cursor", d => d.type === "SIMILAR" ? "pointer" : "default")
       .style("opacity", d => d.type === "THEN" ? 0.65 : 0.7);
 
-    // Edge labels for similarity
     const edgeLabels = g.append("g").selectAll("text").data(links.filter(l => l.type === "SIMILAR")).enter().append("text")
       .attr("text-anchor", "middle")
       .attr("fill", "#f0c04090")
@@ -831,7 +2067,6 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
       .attr("font-size", 9)
       .text(d => (d.score * 100).toFixed(0) + "%");
 
-    // Node group
     const nodeCircles = g.append("g").selectAll("g").data(nodes).enter().append("g")
       .style("cursor", "pointer")
       .call(d3.drag()
@@ -840,7 +2075,6 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
           d.fx = d.x; d.fy = d.y;
         })
         .on("drag", (e, d) => {
-          // Account for zoom transform
           const t = d3.zoomTransform(svg.node());
           d.fx = (e.sourceEvent.offsetX - t.x) / t.k;
           d.fy = (e.sourceEvent.offsetY - t.y) / t.k;
@@ -851,14 +2085,12 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
         })
       );
 
-    // Circle
     nodeCircles.append("circle")
       .attr("r", 16)
       .attr("fill", d => d.doc === "A" ? "#60a5fa18" : "#f59e4218")
       .attr("stroke", d => d.doc === "A" ? "#60a5fa" : "#f59e42")
       .attr("stroke-width", 1.5);
 
-    // Label
     nodeCircles.append("text")
       .attr("text-anchor", "middle").attr("dy", 4)
       .attr("fill", d => d.doc === "A" ? "#60a5fa" : "#f59e42")
@@ -867,67 +2099,65 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
       .attr("font-weight", 600)
       .text(d => d.label);
 
-    // Hover / click on nodes
     nodeCircles
       .on("mouseover", (e, d) => {
+        const tip = graphTooltipRef.current;
+        if (!tip) return;
         const rect = container.getBoundingClientRect();
-        setTooltip({ x: e.clientX - rect.left, y: e.clientY - rect.top - 10, node: d });
+        tip.style.display = "block";
+        tip.style.left = (e.clientX - rect.left + 12) + "px";
+        tip.style.top = (e.clientY - rect.top - 10) + "px";
+        var col = d.doc === "A" ? "#60a5fa" : "#f59e42";
+        var txt = d.text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        tip.innerHTML = '<div style="font-family:JetBrains Mono,monospace;font-size:11px;color:' + col + ';margin-bottom:4px;font-weight:600;">' + d.label + '</div>'
+          + '<div style="font-family:IBM Plex Serif,serif;font-size:11px;color:#8a8f9c;line-height:1.5;max-height:150px;overflow:auto;">' + txt + '\u2026</div>';
       })
-      .on("mouseout", () => setTooltip(null))
+      .on("mouseout", () => {
+        if (graphTooltipRef.current) graphTooltipRef.current.style.display = "none";
+      })
       .on("click", (e, d) => {
         e.stopPropagation();
         setSelectedNode(prev => prev && prev.id === d.id ? null : d);
       });
 
-    // Hover on similarity edges
     linkLines.filter(d => d.type === "SIMILAR")
-      .on("mouseover", function(e, d) {
-        d3.select(this).attr("stroke-width", Math.max(3, (d.score || 0) * 8));
-      })
-      .on("mouseout", function(e, d) {
-        d3.select(this).attr("stroke-width", Math.max(1.5, (d.score || 0) * 5));
-      });
+      .on("mouseover", function(e, d) { d3.select(this).attr("stroke-width", Math.max(3, (d.score || 0) * 8)); })
+      .on("mouseout", function(e, d) { d3.select(this).attr("stroke-width", Math.max(1.5, (d.score || 0) * 5)); });
 
-    // Tick — no clamping, infinite canvas
     simulation.on("tick", () => {
       linkLines
         .attr("x1", d => d.source.x).attr("y1", d => d.source.y)
         .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-
       edgeLabels
         .attr("x", d => (d.source.x + d.target.x) / 2)
         .attr("y", d => (d.source.y + d.target.y) / 2 - 6);
-
       nodeCircles.attr("transform", d => "translate("+d.x+","+d.y+")");
     });
 
-    // Fit to view after initial settle
+    // Fit to view after settle
     setTimeout(() => {
-      simulation.alpha(0.3).restart();
+      simulation.alpha(0.4).restart();
       setTimeout(() => {
-        // Compute bounding box of all nodes
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         nodes.forEach(n => {
-          if (n.x < minX) minX = n.x;
-          if (n.y < minY) minY = n.y;
-          if (n.x > maxX) maxX = n.x;
-          if (n.y > maxY) maxY = n.y;
+          if (n.x < minX) minX = n.x; if (n.y < minY) minY = n.y;
+          if (n.x > maxX) maxX = n.x; if (n.y > maxY) maxY = n.y;
         });
-        const pad = 60;
+        const pad = 40;
         const bw = (maxX - minX) + pad * 2;
         const bh = (maxY - minY) + pad * 2;
-        const scale = Math.min(W / bw, H / bh, 1.5);
-        const cx = (minX + maxX) / 2;
-        const cy = (minY + maxY) / 2;
+        const sc = Math.min(W / bw, H / bh, 1.2);
+        const fcx = (minX + maxX) / 2;
+        const fcy = (minY + maxY) / 2;
         svg.transition().duration(800).call(
           zoomBehavior.transform,
-          d3.zoomIdentity.translate(W/2, H/2).scale(scale).translate(-cx, -cy)
+          d3.zoomIdentity.translate(W/2, H/2).scale(sc).translate(-fcx, -fcy)
         );
-      }, 1500);
+      }, 2000);
     }, 100);
 
     return () => { simulation.stop(); };
-  }, [graphData, chunksA.length, chunksB.length]);
+  }, [graphData, visA.length, visB.length, layout]);
 
   function simEdgeColor(score) {
     if (!score) return "#4a556840";
@@ -946,10 +2176,16 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
 
   return (
     <div style={{ background: "#0e1018", borderRadius: 10, padding: 20 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-        <div style={{ ...mono10, color: "#4a5568" }}>
-          CHUNK GRAPH {"\u00B7"} dashed = THEN (sequential) {"\u00B7"} solid = SIMILAR ({"\u2265"}{(simThreshold*100).toFixed(0)}%)
-          {"\u00B7"} scroll to zoom {"\u00B7"} drag canvas to pan {"\u00B7"} drag nodes to rearrange
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <span style={{ ...mono10, color: "#4a5568" }}>LAYOUT</span>
+          <select value={layout} onChange={e => setLayout(e.target.value)}
+            style={{ background: "#141822", border: "1px solid #1e2230", color: "#9ca3af", borderRadius: 4, padding: "3px 8px", ...mono10, cursor: "pointer", outline: "none" }}>
+            {Object.entries(LAYOUTS).map(([k, v]) => (
+              <option key={k} value={k}>{v.label}</option>
+            ))}
+          </select>
+          <span style={{ ...mono9, color: "#2a2f3a" }}>{LAYOUTS[layout].desc}</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <label style={{ ...mono9, color: "#3a4050" }}>THRESHOLD</label>
@@ -961,26 +2197,102 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
         </div>
       </div>
 
-      {/* Legend */}
-      <div style={{ display: "flex", gap: 20, marginBottom: 12 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <div style={{ width: 12, height: 12, borderRadius: "50%", border: "2px solid #60a5fa", background: "#60a5fa18" }} />
-          <span style={{ ...mono9, color: "#60a5fa" }}>Doc A chunks</span>
+      {/* Node viewport controls */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 10, marginBottom: 12, flexWrap: "wrap",
+        background: "#0a0c12", borderRadius: 6, padding: "8px 12px", border: "1px solid #1e2230",
+      }}>
+        <span style={{ ...mono9, color: "#4a5568", letterSpacing: 1 }}>NODES</span>
+        <span style={{ ...mono9, color: "#2a2f3a" }}>
+          {visA.length + visB.length} of {chunksA.length + chunksB.length}
+        </span>
+
+        {/* Doc A range */}
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <span style={{ ...mono9, color: "#60a5fa" }}>A</span>
+          <input type="number" min={0} max={rangeA[1]} value={rangeA[0]}
+            onChange={e => { const v = Math.max(0, Math.min(rangeA[1], Number(e.target.value))); setRangeA([v, rangeA[1]]); }}
+            style={{ width: 38, background: "#141822", border: "1px solid #60a5fa20", color: "#60a5fa", borderRadius: 3, padding: "2px 4px", ...mono9, textAlign: "center", outline: "none" }}
+          />
+          <input type="range" min={0} max={chunksA.length}
+            value={rangeA[0]}
+            onChange={e => { const v = Math.min(Number(e.target.value), rangeA[1]); setRangeA([v, rangeA[1]]); }}
+            style={{ width: 50, accentColor: "#60a5fa" }}
+          />
+          <input type="range" min={0} max={chunksA.length}
+            value={rangeA[1]}
+            onChange={e => { const v = Math.max(Number(e.target.value), rangeA[0]); setRangeA([rangeA[0], v]); }}
+            style={{ width: 50, accentColor: "#60a5fa" }}
+          />
+          <input type="number" min={rangeA[0]} max={chunksA.length} value={rangeA[1]}
+            onChange={e => { const v = Math.max(rangeA[0], Math.min(chunksA.length, Number(e.target.value))); setRangeA([rangeA[0], v]); }}
+            style={{ width: 38, background: "#141822", border: "1px solid #60a5fa20", color: "#60a5fa", borderRadius: 3, padding: "2px 4px", ...mono9, textAlign: "center", outline: "none" }}
+          />
+          <span style={{ ...mono9, color: "#60a5fa40" }}>{visA.length}/{chunksA.length}</span>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <div style={{ width: 12, height: 12, borderRadius: "50%", border: "2px solid #f59e42", background: "#f59e4218" }} />
-          <span style={{ ...mono9, color: "#f59e42" }}>Doc B chunks</span>
+
+        {/* Doc B range */}
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <span style={{ ...mono9, color: "#f59e42" }}>B</span>
+          <input type="number" min={0} max={rangeB[1]} value={rangeB[0]}
+            onChange={e => { const v = Math.max(0, Math.min(rangeB[1], Number(e.target.value))); setRangeB([v, rangeB[1]]); }}
+            style={{ width: 38, background: "#141822", border: "1px solid #f59e4220", color: "#f59e42", borderRadius: 3, padding: "2px 4px", ...mono9, textAlign: "center", outline: "none" }}
+          />
+          <input type="range" min={0} max={chunksB.length}
+            value={rangeB[0]}
+            onChange={e => { const v = Math.min(Number(e.target.value), rangeB[1]); setRangeB([v, rangeB[1]]); }}
+            style={{ width: 50, accentColor: "#f59e42" }}
+          />
+          <input type="range" min={0} max={chunksB.length}
+            value={rangeB[1]}
+            onChange={e => { const v = Math.max(Number(e.target.value), rangeB[0]); setRangeB([rangeB[0], v]); }}
+            style={{ width: 50, accentColor: "#f59e42" }}
+          />
+          <input type="number" min={rangeB[0]} max={chunksB.length} value={rangeB[1]}
+            onChange={e => { const v = Math.max(rangeB[0], Math.min(chunksB.length, Number(e.target.value))); setRangeB([rangeB[0], v]); }}
+            style={{ width: 38, background: "#141822", border: "1px solid #f59e4220", color: "#f59e42", borderRadius: 3, padding: "2px 4px", ...mono9, textAlign: "center", outline: "none" }}
+          />
+          <span style={{ ...mono9, color: "#f59e4240" }}>{visB.length}/{chunksB.length}</span>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <div style={{ width: 24, height: 0, borderTop: "1.5px dashed #3a4050" }} />
-          <span style={{ ...mono9, color: "#3a4050" }}>THEN</span>
+
+        {/* Presets */}
+        <div style={{ display: "flex", gap: 4, marginLeft: "auto" }}>
+          {[
+            { label: "All", fn: () => { setRangeA([0, chunksA.length]); setRangeB([0, chunksB.length]); } },
+            { label: "20", fn: () => { setRangeA([0, Math.min(20, chunksA.length)]); setRangeB([0, Math.min(20, chunksB.length)]); } },
+            { label: "10", fn: () => { setRangeA([0, Math.min(10, chunksA.length)]); setRangeB([0, Math.min(10, chunksB.length)]); } },
+          ].map(p => (
+            <button key={p.label} onClick={p.fn} style={{
+              ...mono9, background: "#141822", border: "1px solid #1e2230",
+              color: "#4a5568", borderRadius: 3, padding: "2px 8px",
+              cursor: "pointer",
+            }}>{p.label}</button>
+          ))}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <div style={{ width: 24, height: 0, borderTop: "2px solid #f0c040" }} />
-          <span style={{ ...mono9, color: "#f0c040" }}>SIMILAR</span>
+      </div>
+
+      {/* Compact legend */}
+      <div style={{ display: "flex", gap: 14, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <div style={{ width: 10, height: 10, borderRadius: "50%", border: "1.5px solid #60a5fa", background: "#60a5fa18" }} />
+          <span style={{ ...mono9, color: "#60a5fa" }}>A</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <div style={{ width: 10, height: 10, borderRadius: "50%", border: "1.5px solid #f59e42", background: "#f59e4218" }} />
+          <span style={{ ...mono9, color: "#f59e42" }}>B</span>
+        </div>
+        {["sequence", "hierarchical"].includes(layout) && (
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <div style={{ width: 18, height: 0, borderTop: "1.5px dashed #4a5568" }} />
+            <span style={{ ...mono9, color: "#4a5568" }}>THEN</span>
+          </div>
+        )}
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <div style={{ width: 18, height: 0, borderTop: "2px solid #f0c040" }} />
+          <span style={{ ...mono9, color: "#f0c040" }}>SIM</span>
         </div>
         <span style={{ ...mono9, color: "#2a2f3a" }}>
-          {graphData.nodes.length} nodes {"\u00B7"} {graphData.links.filter(l => l.type === "THEN").length} sequential {"\u00B7"} {graphData.links.filter(l => l.type === "SIMILAR").length} similarity
+          {graphData.nodes.length}n {"\u00B7"} {graphData.links.filter(l => l.type === "SIMILAR").length} links {"\u00B7"} zoom + drag
         </span>
       </div>
 
@@ -988,19 +2300,12 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
       <div ref={containerRef} style={{ position: "relative", background: "#0a0c12", borderRadius: 8, border: "1px solid #1e2230", overflow: "hidden" }}>
         <svg ref={svgRef} style={{ display: "block", width: "100%", height: 600 }} />
 
-        {/* Tooltip */}
-        {tooltip && (
-          <div style={{
-            position: "absolute", left: tooltip.x + 12, top: tooltip.y,
-            background: "#141822ee", border: "1px solid #2a2f3a", borderRadius: 6,
-            padding: "8px 12px", pointerEvents: "none", maxWidth: 280, zIndex: 10,
-          }}>
-            <div style={{ ...mono11, color: tooltip.node.doc === "A" ? "#60a5fa" : "#f59e42", marginBottom: 4 }}>
-              {tooltip.node.label}
-            </div>
-            <ChunkContent text={tooltip.node.text} maxLen={250} fontSize={11} />
-          </div>
-        )}
+        {/* Tooltip — ref-based, no React re-renders */}
+        <div ref={graphTooltipRef} style={{
+          display: "none", position: "absolute",
+          background: "#141822ee", border: "1px solid #2a2f3a", borderRadius: 6,
+          padding: "8px 12px", maxWidth: 280, zIndex: 10, pointerEvents: "none",
+        }} />
       </div>
 
       {/* Selected node detail panel */}
@@ -1015,37 +2320,75 @@ function GraphView({ chunksA, chunksB, matrix, interpretations }) {
               {simLinks.length} similarity link{simLinks.length !== 1 ? "s" : ""} above threshold
             </span>
           </div>
-          <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 12.5, color: "#9ca3af", lineHeight: 1.7, marginBottom: simLinks.length > 0 ? 14 : 0 }}>
+          <div style={{ marginBottom: simLinks.length > 0 ? 14 : 0 }}>
             <ChunkContent
-              text={selectedNode.doc === "A" ? chunksA[selectedNode.idx] : chunksB[selectedNode.idx]}
-              maxLen={800} fontSize={12.5}
+              text={selectedNode.doc === "A" ? chunksA[selectedNode.origIdx] : chunksB[selectedNode.origIdx]}
+              maxLen={800} fontSize={12.5} maxHeight={300}
             />
           </div>
           {simLinks.length > 0 && (
             <div>
-              <div style={{ ...mono9, color: "#4a5568", letterSpacing: 1, marginBottom: 8 }}>CONNECTED BY SIMILARITY</div>
+              <div style={{ ...mono9, color: "#4a5568", letterSpacing: 1, marginBottom: 10 }}>CONNECTED BY SIMILARITY</div>
               {simLinks.map((l, idx) => {
-                var otherId = (typeof l.source === "string" ? l.source : l.source.id) === selectedNode.id
-                  ? (typeof l.target === "string" ? l.target : l.target.id)
-                  : (typeof l.source === "string" ? l.source : l.source.id);
+                var srcId = typeof l.source === "string" ? l.source : l.source.id;
+                var tgtId = typeof l.target === "string" ? l.target : l.target.id;
+                var otherId = srcId === selectedNode.id ? tgtId : srcId;
+                var otherDoc = otherId.charAt(0);
+                var otherIdx = parseInt(otherId.slice(1), 10) - 1;
+                var otherText = otherDoc === "A" ? chunksA[otherIdx] : chunksB[otherIdx];
+                var selText = selectedNode.doc === "A" ? chunksA[selectedNode.origIdx] : chunksB[selectedNode.origIdx];
+                var selColor = selectedNode.doc === "A" ? "#60a5fa" : "#f59e42";
+                var otherColor = otherDoc === "A" ? "#60a5fa" : "#f59e42";
                 return (
                   <div key={idx} style={{
-                    display: "flex", alignItems: "center", gap: 10, padding: "6px 0",
-                    borderTop: idx > 0 ? "1px solid #1e2230" : "none",
+                    marginBottom: 10, background: "#0c0e16", borderRadius: 8,
+                    border: "1px solid #1e2230", overflow: "hidden",
                   }}>
-                    <span style={{
-                      ...mono11, padding: "2px 8px", borderRadius: 4,
-                      color: otherId.startsWith("A") ? "#60a5fa" : "#f59e42",
-                      background: otherId.startsWith("A") ? "#60a5fa12" : "#f59e4212",
-                    }}>{otherId}</span>
-                    <span style={{ ...mono11, color: "#f0c040", fontWeight: 700 }}>
-                      {(l.score * 100).toFixed(1)}%
-                    </span>
-                    {l.interp && (
-                      <span style={{ ...mono9, color: "#818cf8", background: "#818cf812", padding: "2px 6px", borderRadius: 3 }}>
-                        {"\u{1F9E0}"} interpreted
+                    {/* Header bar */}
+                    <div style={{
+                      display: "flex", alignItems: "center", gap: 10, padding: "8px 12px",
+                      borderBottom: "1px solid #1e2230", background: "#0e1018",
+                    }}>
+                      <span style={{ ...mono11, padding: "2px 8px", borderRadius: 4, color: selColor, background: selColor + "12" }}>
+                        {selectedNode.label}
                       </span>
+                      <span style={{ color: "#3a4050", fontSize: 12 }}>{"\u27F7"}</span>
+                      <span style={{ ...mono11, padding: "2px 8px", borderRadius: 4, color: otherColor, background: otherColor + "12" }}>
+                        {otherId}
+                      </span>
+                      <span style={{ ...mono11, color: "#f0c040", fontWeight: 700 }}>
+                        {(l.score * 100).toFixed(1)}%
+                      </span>
+                      {l.interp && (
+                        <span style={{ ...mono9, color: "#818cf8", background: "#818cf812", padding: "2px 6px", borderRadius: 3 }}>
+                          {"\u{1F9E0}"} interpreted
+                        </span>
+                      )}
+                    </div>
+                    {/* Side-by-side chunks */}
+                    <div style={{ display: "flex", gap: 1 }}>
+                      <div style={{ flex: "1 1 50%", minWidth: 0, padding: 10, borderRight: "1px solid #1e2230", overflow: "hidden" }}>
+                        <div style={{ ...mono9, color: selColor, marginBottom: 4, letterSpacing: 1 }}>{selectedNode.label}</div>
+                        <ChunkContent text={selText} maxLen={400} fontSize={11} maxHeight={200} />
+                      </div>
+                      <div style={{ flex: "1 1 50%", minWidth: 0, padding: 10, overflow: "hidden" }}>
+                        <div style={{ ...mono9, color: otherColor, marginBottom: 4, letterSpacing: 1 }}>{otherId}</div>
+                        <ChunkContent text={otherText} maxLen={400} fontSize={11} maxHeight={200} />
+                      </div>
+                    </div>
+                    {/* Interpretation */}
+                    {l.interp && (
+                      <div style={{ padding: "8px 12px", borderTop: "1px solid #1e2230", background: "#0e1018" }}>
+                        <div style={{ ...mono9, color: "#818cf8", letterSpacing: 1, marginBottom: 4 }}>{"\u{1F9E0}"} INTERPRETATION</div>
+                        <div style={{ fontFamily: "'IBM Plex Serif', serif", fontSize: 12, color: "#9ca3af", lineHeight: 1.7 }}>{l.interp}</div>
+                      </div>
                     )}
+                    {/* Drill-down */}
+                    <div style={{ padding: "0 12px 8px" }}>
+                      <DrillDown chunkA={selText} chunkB={otherText}
+                        macroLabelA={selectedNode.label} macroLabelB={otherId}
+                        microSize={microSize || "256"} />
+                    </div>
                   </div>
                 );
               })}
@@ -1069,9 +2412,13 @@ function App() {
   const [selectedCell, setSelectedCell] = useState(null);
   const [expandedMatch, setExpandedMatch] = useState(0);
   const [tab, setTab] = useState("heatmap");
-  const [chunkTarget, setChunkTarget] = useState(512);
+  const [chunkMode, setChunkMode] = useState("512");
+  const [macroSize, setMacroSize] = useState(2048);
+  const [microSize, setMicroSize] = useState("256");
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
-  const [ollamaModel, setOllamaModel] = useState("gptoss29b");
+  const [ollamaModel, setOllamaModel] = useState("gpt-oss:20b");
+  const [promptTemplate, setPromptTemplate] = useState(DEFAULT_PROMPT_TEMPLATE);
+  const [showPromptEditor, setShowPromptEditor] = useState(false);
   const [interpretations, setInterpretations] = useState({});
   const [interpStatus, setInterpStatus] = useState({});
   const [batchInterpreting, setBatchInterpreting] = useState(false);
@@ -1084,8 +2431,8 @@ function App() {
     setExpandedMatch(0); setInterpretations({}); setInterpStatus({});
     setTimeout(() => {
       try {
-        const cA = chunkDocument(textA, chunkTarget, Math.floor(chunkTarget * 0.12));
-        const cB = chunkDocument(textB, chunkTarget, Math.floor(chunkTarget * 0.12));
+        const cA = chunkDocument(textA, chunkMode, macroSize);
+        const cB = chunkDocument(textB, chunkMode, macroSize);
         const { matrix, vocab } = computeSimilarityMatrix(cA, cB);
         const pairs = [];
         for (let i = 0; i < matrix.length; i++)
@@ -1100,30 +2447,35 @@ function App() {
       } catch (err) { console.error(err); }
       setProcessing(false);
     }, 50);
-  }, [textA, textB, chunkTarget]);
+  }, [textA, textB, chunkMode, macroSize]);
 
   const interpretPair = useCallback(async (i, j, score, cA, cB) => {
     const k = i+"-"+j;
     setInterpStatus(p => ({ ...p, [k]: "loading" }));
     try {
-      const r = await queryOllama(ollamaUrl, ollamaModel, cA, cB, score);
+      const r = await queryOllama(ollamaUrl, ollamaModel, cA, cB, score, null, promptTemplate);
       setInterpretations(p => ({ ...p, [k]: r }));
       setInterpStatus(p => ({ ...p, [k]: "done" }));
     } catch (err) { setInterpStatus(p => ({ ...p, [k]: "error" })); }
-  }, [ollamaUrl, ollamaModel]);
+  }, [ollamaUrl, ollamaModel, promptTemplate]);
 
-  const batchInterpret = useCallback(async (count) => {
+  const batchInterpret = useCallback(async (count, minScore) => {
     if (!results) return;
     setBatchInterpreting(true);
     const ctrl = new AbortController();
     abortRef.current = ctrl;
-    for (const m of results.pairs.slice(0, count)) {
+    // If minScore is set, interpret all pairs at or above that threshold
+    // Otherwise, interpret top N by count
+    const targets = minScore != null
+      ? results.pairs.filter(m => m.score >= minScore)
+      : results.pairs.slice(0, count);
+    for (const m of targets) {
       if (ctrl.signal.aborted) break;
       const k = m.i+"-"+m.j;
       if (interpretations[k]) continue;
       setInterpStatus(p => ({ ...p, [k]: "loading" }));
       try {
-        const r = await queryOllama(ollamaUrl, ollamaModel, results.chunksA[m.i], results.chunksB[m.j], m.score, ctrl.signal);
+        const r = await queryOllama(ollamaUrl, ollamaModel, results.chunksA[m.i], results.chunksB[m.j], m.score, ctrl.signal, promptTemplate);
         setInterpretations(p => ({ ...p, [k]: r }));
         setInterpStatus(p => ({ ...p, [k]: "done" }));
       } catch (err) {
@@ -1132,9 +2484,10 @@ function App() {
       }
     }
     setBatchInterpreting(false);
-  }, [results, ollamaUrl, ollamaModel, interpretations]);
+  }, [results, ollamaUrl, ollamaModel, interpretations, promptTemplate]);
 
   const topMatches = results ? results.pairs.slice(0, 20) : [];
+  const pairsAbove30 = results ? results.pairs.filter(p => p.score >= 0.3).length : 0;
   const interpretedCount = Object.values(interpStatus).filter(s => s === "done").length;
 
   const actBtn = (on, accent="#818cf8") => ({
@@ -1164,12 +2517,38 @@ function App() {
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <label style={{ ...mono10, color: "#4a5568", letterSpacing: 1 }}>CHUNKS</label>
-            <select value={chunkTarget} onChange={e => setChunkTarget(Number(e.target.value))}
+            <select value={chunkMode} onChange={e => setChunkMode(e.target.value)}
               style={{ background: "#141822", border: "1px solid #1e2230", color: "#9ca3af", borderRadius: 4, padding: "4px 8px", ...mono11, cursor: "pointer", outline: "none" }}>
-              <option value={256}>256 tok</option>
-              <option value={512}>512 tok</option>
-              <option value={768}>768 tok</option>
-              <option value={1024}>1024 tok</option>
+              <option value="macro">Macro (drill-down)</option>
+              <option value="row">Row / Paragraph</option>
+              <option value="256">256 tok</option>
+              <option value="512">512 tok</option>
+              <option value="768">768 tok</option>
+              <option value="1024">1024 tok</option>
+            </select>
+          </div>
+          {chunkMode === "macro" && (
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <label style={{ ...mono9, color: "#34d399", letterSpacing: 1 }}>MACRO</label>
+              <select value={macroSize} onChange={e => setMacroSize(Number(e.target.value))}
+                style={{ background: "#141822", border: "1px solid #34d39930", color: "#34d399", borderRadius: 4, padding: "3px 6px", ...mono10, cursor: "pointer", outline: "none" }}>
+                <option value={1024}>1024</option>
+                <option value={1536}>1536</option>
+                <option value={2048}>2048</option>
+                <option value={3072}>3072</option>
+                <option value={4096}>4096</option>
+              </select>
+            </div>
+          )}
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <label style={{ ...mono9, color: "#818cf8", letterSpacing: 1 }}>DRILL</label>
+            <select value={microSize} onChange={e => setMicroSize(e.target.value)}
+              style={{ background: "#141822", border: "1px solid #818cf830", color: "#818cf8", borderRadius: 4, padding: "3px 6px", ...mono10, cursor: "pointer", outline: "none" }}>
+              <option value="row">Row / Paragraph</option>
+              <option value="128">128</option>
+              <option value="256">256</option>
+              <option value="384">384</option>
+              <option value="512">512</option>
             </select>
           </div>
           <button onClick={analyze} disabled={!canRun || processing} style={{
@@ -1203,12 +2582,73 @@ function App() {
           {results && !batchInterpreting && <>
             <button onClick={() => batchInterpret(10)} style={actBtn(true)}>{"\u25B6"} Top 10</button>
             <button onClick={() => batchInterpret(20)} style={actBtn(true)}>{"\u25B6"} Top 20</button>
+            <button onClick={() => batchInterpret(null, 0.3)} style={actBtn(true, "#34d399")}>
+              {"\u25B6"} All {"\u2265"}30% ({pairsAbove30})
+            </button>
           </>}
           {batchInterpreting && <>
             <button onClick={() => { if(abortRef.current) abortRef.current.abort(); setBatchInterpreting(false); }} style={actBtn(true, "#f87171")}>{"\u25A0"} Stop</button>
             <span style={{ ...mono9, color: "#818cf8", animation: "pulse 1.2s infinite" }}>{interpretedCount} done</span>
           </>}
+          <button onClick={() => setShowPromptEditor(!showPromptEditor)} style={{
+            ...mono9, background: showPromptEditor ? "#818cf820" : "#141822",
+            border: "1px solid " + (showPromptEditor ? "#818cf850" : "#1e2230"),
+            color: showPromptEditor ? "#818cf8" : "#4a5568",
+            borderRadius: 4, padding: "4px 10px", cursor: "pointer", marginLeft: "auto",
+          }}>{"\u270E"} Prompt</button>
         </div>
+
+        {/* Prompt editor */}
+        {showPromptEditor && (
+          <div style={{
+            background: "#0c0e16", borderRadius: 8, padding: 14, marginBottom: 32, marginTop: -24,
+            border: "1px solid #818cf820",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+              <div style={{ ...mono9, color: "#818cf8", letterSpacing: 1 }}>LLM PROMPT TEMPLATE</div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={() => setPromptTemplate(DEFAULT_PROMPT_TEMPLATE)} style={{
+                  ...mono9, background: "#141822", border: "1px solid #1e2230",
+                  color: "#4a5568", borderRadius: 3, padding: "2px 8px", cursor: "pointer",
+                }}>reset default</button>
+              </div>
+            </div>
+            {/* Preset investigation modes */}
+            <div style={{ display: "flex", gap: 4, marginBottom: 8, flexWrap: "wrap" }}>
+              {[
+                { label: "Default", t: DEFAULT_PROMPT_TEMPLATE },
+                { label: "Contradictions", t: "You are a fact-checker comparing two text segments ({{SCORE}}% similar).\n\nSEGMENT A:\n\"\"\"\n{{CHUNK_A}}\n\"\"\"\n\nSEGMENT B:\n\"\"\"\n{{CHUNK_B}}\n\"\"\"\n\nIdentify any contradictions, conflicting claims, or inconsistencies between these segments. If none exist, state that they are consistent. Be specific about what contradicts." },
+                { label: "Compliance", t: "You are a compliance auditor. Compare these two segments ({{SCORE}}% similar) for regulatory or policy alignment.\n\nSEGMENT A (SOURCE):\n\"\"\"\n{{CHUNK_A}}\n\"\"\"\n\nSEGMENT B (TARGET):\n\"\"\"\n{{CHUNK_B}}\n\"\"\"\n\nDoes Segment B satisfy or comply with the requirements in Segment A? List any gaps, violations, or areas of non-compliance. Be specific." },
+                { label: "Plagiarism", t: "You are an academic integrity analyst. These two segments have a {{SCORE}}% lexical similarity.\n\nSEGMENT A:\n\"\"\"\n{{CHUNK_A}}\n\"\"\"\n\nSEGMENT B:\n\"\"\"\n{{CHUNK_B}}\n\"\"\"\n\nAssess whether Segment B appears to be derived from Segment A (or vice versa). Consider: paraphrasing, structural copying, shared unique phrases, and independent convergence. Rate confidence: likely copied, possibly paraphrased, likely independent." },
+                { label: "Coverage", t: "You are a document coverage analyst. Segment B should cover the topics in Segment A ({{SCORE}}% overlap).\n\nSEGMENT A (REFERENCE):\n\"\"\"\n{{CHUNK_A}}\n\"\"\"\n\nSEGMENT B (UNDER REVIEW):\n\"\"\"\n{{CHUNK_B}}\n\"\"\"\n\nWhat topics from A are covered in B? What topics from A are missing in B? What does B add that A doesn't have?" },
+                { label: "Diff", t: "You are a precise change-tracker. These segments are {{SCORE}}% similar.\n\nBEFORE:\n\"\"\"\n{{CHUNK_A}}\n\"\"\"\n\nAFTER:\n\"\"\"\n{{CHUNK_B}}\n\"\"\"\n\nDescribe the specific changes: what was added, removed, modified, or reworded. Be concise and factual." },
+                { label: "Q&A", t: "Given these two related text segments ({{SCORE}}% similar), answer this question about their relationship:\n\nSEGMENT A:\n\"\"\"\n{{CHUNK_A}}\n\"\"\"\n\nSEGMENT B:\n\"\"\"\n{{CHUNK_B}}\n\"\"\"\n\nHow do these segments relate to each other? What would someone need to understand from A to make sense of B, and vice versa?" },
+              ].map(p => (
+                <button key={p.label} onClick={() => setPromptTemplate(p.t)} style={{
+                  ...mono9,
+                  background: promptTemplate === p.t ? "#818cf820" : "#141822",
+                  border: "1px solid " + (promptTemplate === p.t ? "#818cf850" : "#1e2230"),
+                  color: promptTemplate === p.t ? "#818cf8" : "#4a5568",
+                  borderRadius: 3, padding: "3px 8px", cursor: "pointer",
+                }}>{p.label}</button>
+              ))}
+            </div>
+            <textarea
+              value={promptTemplate}
+              onChange={e => setPromptTemplate(e.target.value)}
+              style={{
+                width: "100%", minHeight: 140, maxHeight: 400, resize: "vertical",
+                background: "#0a0c12", color: "#9ca3af", border: "1px solid #1e2230",
+                borderRadius: 6, padding: 12,
+                fontFamily: "'JetBrains Mono', monospace", fontSize: 11,
+                lineHeight: 1.6, outline: "none", boxSizing: "border-box",
+              }}
+            />
+            <div style={{ ...mono9, color: "#2a2f3a", marginTop: 6, lineHeight: 1.8 }}>
+              Placeholders: <span style={{ color: "#818cf8" }}>{"{{CHUNK_A}}"}</span> <span style={{ color: "#818cf8" }}>{"{{CHUNK_B}}"}</span> <span style={{ color: "#818cf8" }}>{"{{SCORE}}"}</span> (percent) <span style={{ color: "#818cf8" }}>{"{{SCORE_RAW}}"}</span> (0-1)
+            </div>
+          </div>
+        )}
 
         {results && (
           <div>
@@ -1230,7 +2670,7 @@ function App() {
 
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "1px solid #1e2230", marginBottom: 20 }}>
               <div style={{ display: "flex" }}>
-                {["heatmap", "matches", "graph", "distribution"].map(t => (
+                {["heatmap", "matches", "documents", "graph", "distribution"].map(t => (
                   <button key={t} onClick={() => setTab(t)} style={{
                     ...mono11, letterSpacing: 1, textTransform: "uppercase",
                     background: "none", border: "none",
@@ -1253,6 +2693,7 @@ function App() {
             </div>
 
             {tab === "heatmap" && (
+              <FullscreenPanel label="SIMILARITY HEATMAP">
               <div style={{ background: "#0e1018", borderRadius: 10, padding: 20 }}>
                 <div style={{ ...mono10, color: "#4a5568", marginBottom: 12 }}>SIMILARITY MATRIX {"\u00B7"} click any cell for details</div>
                 <Heatmap matrix={results.matrix} chunksA={results.chunksA} chunksB={results.chunksB} onCellClick={setSelectedCell} selectedCell={selectedCell} />
@@ -1262,18 +2703,26 @@ function App() {
                       A{selectedCell[0]+1} {"\u27F7"} B{selectedCell[1]+1} {"\u00B7"} {(results.matrix[selectedCell[0]][selectedCell[1]]*100).toFixed(1)}%
                     </div>
                     <div style={{ display: "flex", gap: 12 }}>
-                      <div style={{ flex: 1, borderLeft: "3px solid #60a5fa20", padding: "8px 12px" }}>
+                      <div style={{ flex: "1 1 50%", minWidth: 0, borderLeft: "3px solid #60a5fa20", padding: "8px 12px", overflow: "hidden" }}>
                         <div style={{ ...mono9, color: "#60a5fa", marginBottom: 6 }}>DOC A {"\u00B7"} CHUNK {selectedCell[0]+1}</div>
                         <ChunkContent text={results.chunksA[selectedCell[0]]} maxLen={400} fontSize={12} />
                       </div>
-                      <div style={{ flex: 1, borderLeft: "3px solid #f59e4220", padding: "8px 12px" }}>
+                      <div style={{ flex: "1 1 50%", minWidth: 0, borderLeft: "3px solid #f59e4220", padding: "8px 12px", overflow: "hidden" }}>
                         <div style={{ ...mono9, color: "#f59e42", marginBottom: 6 }}>DOC B {"\u00B7"} CHUNK {selectedCell[1]+1}</div>
                         <ChunkContent text={results.chunksB[selectedCell[1]]} maxLen={400} fontSize={12} />
                       </div>
                     </div>
+                    <DrillDown
+                      chunkA={results.chunksA[selectedCell[0]]}
+                      chunkB={results.chunksB[selectedCell[1]]}
+                      macroLabelA={"A"+(selectedCell[0]+1)}
+                      macroLabelB={"B"+(selectedCell[1]+1)}
+                      microSize={microSize}
+                    />
                   </div>
                 )}
               </div>
+              </FullscreenPanel>
             )}
 
             {tab === "matches" && (
@@ -1288,19 +2737,34 @@ function App() {
                       onToggle={() => setExpandedMatch(expandedMatch === idx ? -1 : idx)}
                       interpretation={interpretations[k]} interpStatus={interpStatus[k]}
                       onInterpret={() => interpretPair(m.i, m.j, m.score, results.chunksA[m.i], results.chunksB[m.j])}
+                      microSize={microSize}
                     />
                   );
                 })}
               </div>
             )}
 
-            {tab === "graph" && (
-              <GraphView
+            {tab === "documents" && (
+              <FullscreenPanel label="DOCUMENT VIEW">
+              <DocumentView
                 chunksA={results.chunksA}
                 chunksB={results.chunksB}
                 matrix={results.matrix}
                 interpretations={interpretations}
               />
+              </FullscreenPanel>
+            )}
+
+            {tab === "graph" && (
+              <FullscreenPanel label="CHUNK GRAPH">
+              <GraphView
+                chunksA={results.chunksA}
+                chunksB={results.chunksB}
+                matrix={results.matrix}
+                interpretations={interpretations}
+                microSize={microSize}
+              />
+              </FullscreenPanel>
             )}
 
             {tab === "distribution" && (
